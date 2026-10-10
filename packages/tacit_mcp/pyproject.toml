@@ -1,0 +1,15 @@
+[project]
+name = "tacit-mcp"
+version = "0.1.0"
+requires-python = ">=3.12,<3.15"
+dependencies = ['tacit-client', 'mcp>=1.12,<2']
+
+[project.scripts]
+tacit-mcp = "tacit_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+tacit-client = { workspace = true }

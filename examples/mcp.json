@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tacit": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/Tacit", "tacit-mcp"],
+      "env": {"TACIT_API_URL": "http://127.0.0.1:8000", "TACIT_AGENT_TOKEN": "demo-agent"}
+    }
+  }
+}
