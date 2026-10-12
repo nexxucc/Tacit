@@ -93,6 +93,14 @@ class Provider:
                 if self.org_member
                 else httpx.Response(404)
             )
+        if path.startswith("/repos/") and "/commits/" in path:
+            sha = path.rsplit("/", 1)[1]
+            return httpx.Response(200, json={"sha": sha})
+        if path.startswith("/repos/") and "/contents/" in path:
+            file = path.split("/contents/", 1)[1]
+            if file == "missing.py":
+                return httpx.Response(404)
+            return httpx.Response(200, json={"type": "file", "path": file, "sha": "b" * 40})
         raise AssertionError(path)
 
 
@@ -217,7 +225,7 @@ def test_multi_workspace_roles_agent_ceiling_and_revocation(setup):
     grant = {"user_id": "gh-2", "role": "maintainer", "repository_id": "gh-101"}
     assert client.post("/v1/workspaces/gh-1/roles", headers=learner, json=grant).status_code == 403
     assert client.post("/v1/workspaces/gh-1/roles", headers=owner, json=grant).status_code == 200
-    assert client.post("/v1/repos/gh-101/publications", headers=learner).status_code == 501
+    assert client.post("/v1/repos/gh-101/publications", headers=learner).status_code == 422
     agent = client.post(
         "/v1/auth/agent-tokens", headers=learner, json={"repository_ids": ["gh-101"]}
     ).json()
@@ -431,4 +439,4 @@ def test_repository_readdition_requires_signed_event(setup):
         "repositories_added": [{"id": 101, "full_name": "user1/code"}],
     }
     assert webhook(client, payload, delivery="add").status_code == 200
-    assert client.post("/v1/repos/gh-101/publications", headers=owner).status_code == 501
+    assert client.post("/v1/repos/gh-101/publications", headers=owner).status_code == 422

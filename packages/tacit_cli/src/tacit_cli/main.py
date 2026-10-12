@@ -1,9 +1,12 @@
 import json
 import platform
+import sys
 import time
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 import typer
@@ -15,7 +18,16 @@ from tacit_client.credentials import (
     save_token,
     secure_backend,
 )
-from tacit_contracts.models import ContextRequest, QuestionRequest, Role, ScenarioRequest
+from tacit_contracts.models import (
+    ContextRequest,
+    DraftRequest,
+    DraftView,
+    PublicationRequest,
+    QuestionRequest,
+    Role,
+    Rule,
+    ScenarioRequest,
+)
 
 RepoOption = Annotated[str, typer.Option("--repo")]
 SnapshotOption = Annotated[str, typer.Option("--snapshot")]
@@ -128,10 +140,17 @@ def evaluate(
 
 
 @app.command()
-def history(decision: str, repo: RepoOption, snapshot: SnapshotOption, agent: bool = False) -> None:
+def history(
+    decision: str,
+    repo: RepoOption,
+    snapshot: SnapshotOption,
+    agent: bool = False,
+    cursor: int = 0,
+    limit: int = 20,
+) -> None:
     run(
         "GET",
-        f"/v1/repos/{encoded(repo)}/decisions/{encoded(decision)}/history?snapshot_id={encoded(snapshot)}",
+        f"/v1/repos/{encoded(repo)}/decisions/{encoded(decision)}/history?snapshot_id={encoded(snapshot)}&cursor={cursor}&limit={limit}",
         agent=agent,
     )
 
@@ -268,9 +287,111 @@ def revoke_role(
 
 
 @app.command()
-def teach() -> None:
-    typer.echo("Native teaching capture and review are not implemented yet.", err=True)
-    raise typer.Exit(1)
+def teach(
+    repo: RepoOption,
+    commit: CommitOption,
+    source_files: Annotated[list[str], typer.Option("--file")],
+    text_file: Annotated[
+        Path, typer.Option("--text-file", help="Temporary text input for the future voice workflow")
+    ],
+    rule_file: Annotated[Path | None, typer.Option("--rule")] = None,
+    decision: Annotated[
+        str | None, typer.Option("--decision", help="Supersede an existing decision")
+    ] = None,
+    expected_snapshot: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-snapshot", help="Defaults to current head; use 'none' for an empty head"
+        ),
+    ] = None,
+    operation_id: Annotated[str | None, typer.Option("--operation-id")] = None,
+) -> None:
+    """Create a source-bound teaching draft. This command never publishes."""
+    operation = operation_id or str(uuid4())
+    try:
+        statement = text_file.read_text(encoding="utf-8")
+        rule = Rule.model_validate_json(rule_file.read_text()) if rule_file else None
+        with TacitClient() as client:
+            if expected_snapshot is None:
+                head = client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+                if not isinstance(head, dict):
+                    raise ClientError("Invalid knowledge head response")
+                base = head.get("snapshot_id")
+            else:
+                base = None if expected_snapshot == "none" else expected_snapshot
+            body = DraftRequest(
+                operation_id=operation,
+                statement=statement,
+                source_commit=commit,
+                files=tuple(source_files),
+                expected_snapshot_id=base,
+                decision_id=decision,
+                rule=rule,
+            )
+            typer.echo(
+                f"Draft operation ID: {operation}; expected snapshot: {base or 'none'} (reuse both with the same input on retry)",
+                err=True,
+            )
+            result = client.request(
+                "POST",
+                f"/v1/repos/{encoded(repo)}/teaching-sessions",
+                json=body.model_dump(mode="json"),
+            )
+        typer.echo(json.dumps(result, indent=2))
+    except (ClientError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command()
+def review(draft: str, repo: RepoOption) -> None:
+    """Show proposed knowledge, source evidence, prior revision and exact review digest."""
+    run("GET", f"/v1/repos/{encoded(repo)}/teaching-sessions/{encoded(draft)}")
+
+
+@app.command()
+def confirm(
+    draft: str,
+    repo: RepoOption,
+    operation_id: Annotated[str | None, typer.Option("--operation-id")] = None,
+) -> None:
+    """Review again and explicitly confirm an immutable publication."""
+    operation = operation_id or str(uuid4())
+    try:
+        with TacitClient() as client:
+            view = DraftView.model_validate(
+                client.request(
+                    "GET", f"/v1/repos/{encoded(repo)}/teaching-sessions/{encoded(draft)}"
+                )
+            )
+            typer.echo(json.dumps(view.model_dump(mode="json"), indent=2), err=True)
+            typer.echo(
+                f"Confirmation operation ID: {operation} (reuse this ID if the outcome is uncertain)",
+                err=True,
+            )
+            with redirect_stdout(sys.stderr):
+                confirmed = typer.confirm("Publish exactly this reviewed knowledge?", err=True)
+            if not confirmed:
+                typer.echo("Cancelled; no knowledge was published.", err=True)
+                raise typer.Exit(0)
+            body = PublicationRequest(
+                draft_id=draft,
+                operation_id=operation,
+                review_digest=view.review_digest,
+                expected_snapshot_id=view.expected_snapshot_id,
+            )
+            result = client.request(
+                "POST", f"/v1/repos/{encoded(repo)}/publications", json=body.model_dump(mode="json")
+            )
+        typer.echo(json.dumps(result, indent=2))
+    except (ClientError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@repos.command("head")
+def repo_head(repo: RepoOption, agent: bool = False) -> None:
+    run("GET", f"/v1/repos/{encoded(repo)}/head", agent=agent)
 
 
 @app.command()

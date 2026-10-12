@@ -27,11 +27,16 @@ class Snapshot:
     repository_id: str
     source_commit: str
     decisions: tuple[Decision, ...]
+    parent_snapshot_id: str | None = None
+    manifest_digest: str | None = None
 
 
 class KnowledgeStore(Protocol):
     def repositories(self) -> tuple[Repository, ...]: ...
     def snapshot(self, repository: str, snapshot: str) -> Snapshot | None: ...
+    def history(
+        self, repository: str, snapshot: str, decision: str, cursor: int, limit: int
+    ) -> tuple[Decision, ...]: ...
 
 
 class KnowledgeService:
@@ -67,7 +72,8 @@ class KnowledgeService:
         items = tuple(
             d
             for d in snap.decisions
-            if not request.files or set(d.files).intersection(request.files)
+            if d.source_commit == request.source_commit
+            and (not request.files or set(d.files).intersection(request.files))
         )
         page = items[request.cursor : request.cursor + request.limit]
         more = request.cursor + len(page) < len(items)
@@ -82,13 +88,27 @@ class KnowledgeService:
             evidence=tuple(e for d in page for e in d.evidence),
             truncated=more,
             next_cursor=request.cursor + len(page) if more else None,
+            warnings=("Retained knowledge from other commits needs applicability review",)
+            if any(d.source_commit != request.source_commit for d in snap.decisions)
+            else (),
         )
 
     def evaluate(self, p: Principal, rid: str, request: ScenarioRequest) -> EvaluationResponse:
         _, snap = self.snapshot(p, rid, request.snapshot_id)
         result, references = evaluate(
-            snap.decisions if request.source_commit == snap.source_commit else (), request.facts
+            tuple(d for d in snap.decisions if d.source_commit == request.source_commit)
+            if request.source_commit == snap.source_commit
+            else (),
+            request.facts,
         )
         return EvaluationResponse(
             repository_id=rid, snapshot_id=snap.id, decision=result, rule_references=references
         )
+
+    def history(
+        self, p: Principal, rid: str, sid: str, did: str, cursor: int, limit: int
+    ) -> tuple[Decision, ...]:
+        _, snap = self.snapshot(p, rid, sid)
+        if not any(d.id == did for d in snap.decisions):
+            raise DomainError("not_found", "Decision unavailable", 404)
+        return self.store.history(rid, sid, did, cursor, limit)

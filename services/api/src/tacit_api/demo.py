@@ -31,6 +31,16 @@ class DemoStore:
         )
         return Snapshot(snapshot, repository, DEMO_COMMIT, (decision,))
 
+    def history(
+        self, repository: str, snapshot: str, decision: str, cursor: int, limit: int
+    ) -> tuple[Decision, ...]:
+        snap = self.snapshot(repository, snapshot)
+        return (
+            tuple(d for d in snap.decisions if d.id == decision)[cursor : cursor + limit]
+            if snap
+            else ()
+        )
+
 
 def demo_principals() -> dict[str, Principal]:
     def principal(role: Role, agent: bool = False) -> Principal:

@@ -61,4 +61,42 @@ class PostgreSQLStore:
                 repository,
                 snap.source_commit,
                 tuple(Decision.model_validate(r.content) for r in revisions),
+                parent_snapshot_id=snap.parent_snapshot_id,
+                manifest_digest=snap.digest,
             )
+
+    def history(
+        self, repository: str, snapshot: str, decision: str, cursor: int, limit: int
+    ) -> tuple[Decision, ...]:
+        with Session(self.engine) as db:
+            revision = db.scalar(
+                select(DecisionRevision)
+                .join(
+                    SnapshotMember,
+                    (SnapshotMember.workspace_id == DecisionRevision.workspace_id)
+                    & (SnapshotMember.repository_id == DecisionRevision.repository_id)
+                    & (SnapshotMember.revision_id == DecisionRevision.id),
+                )
+                .where(
+                    SnapshotMember.repository_id == repository,
+                    SnapshotMember.snapshot_id == snapshot,
+                    DecisionRevision.decision_id == decision,
+                )
+            )
+            result = []
+            visited: set[str] = set()
+            for index in range(cursor + limit):
+                if revision is None or revision.id in visited or revision.decision_id != decision:
+                    break
+                visited.add(revision.id)
+                if index >= cursor:
+                    result.append(Decision.model_validate(revision.content))
+                revision = (
+                    db.get(
+                        DecisionRevision,
+                        (revision.workspace_id, repository, revision.parent_revision_id),
+                    )
+                    if revision.parent_revision_id
+                    else None
+                )
+            return tuple(result)

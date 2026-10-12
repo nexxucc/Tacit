@@ -7,7 +7,7 @@ description: Retrieve confirmed, source-bound project intent from Tacit before e
 
 Resolve the repository ID, confirmed snapshot and checked-out commit explicitly. If they are unavailable, ask for the missing mapping; do not guess a workspace or silently retrieve another repository.
 
-Prefer Tacit's MCP tools: `list_workspaces`, `list_repositories`, `get_context`, `ask_repository`, `evaluate_scenario`, `get_decision_history`. Follow continuation cursors when additional applicable context is needed. The initial scaffold returns scope-matched statements for questions, not a reasoned answer.
+Prefer Tacit's MCP tools: `list_workspaces`, `list_repositories`, `get_context`, `ask_repository`, `evaluate_scenario`, `get_decision_history`. Follow continuation cursors when additional applicable context is needed. As of 2026-10-12, PostgreSQL-backed confirmed publication/context/history and delegated agent access are implemented with automated MCP coverage. Question tools still return scope-matched statements, not a reasoned answer. Real Codex/Claude client interoperability remains unverified.
 
 CLI fallback uses the dedicated `TACIT_AGENT_TOKEN` profile and `--agent`:
 ```sh

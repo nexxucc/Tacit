@@ -4,9 +4,11 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
+from tacit_contracts.models import SourceBinding
 from tacit_domain.access import DomainError
 
 
@@ -171,3 +173,40 @@ class GitHub:
                 "provider_unavailable", "Invalid GitHub access response", 503
             ) from None
         return tuple(result)
+
+    def source_bindings(
+        self, token: str, full_name: str, commit: str, files: tuple[str, ...]
+    ) -> tuple[SourceBinding, ...]:
+        repo = quote(full_name, safe="/")
+        response = self.request("GET", f"/repos/{repo}/commits/{commit}", token=token)
+        try:
+            if response.status_code != 200 or response.json().get("sha") != commit:
+                raise DomainError(
+                    "source_unbound", "Commit is not available in this repository", 409
+                )
+            bindings = []
+            for path in files:
+                response = self.request(
+                    "GET",
+                    f"/repos/{repo}/contents/{quote(path, safe='/')}?ref={commit}",
+                    token=token,
+                )
+                content = response.json() if response.status_code == 200 else None
+                if (
+                    not isinstance(content, dict)
+                    or content.get("type") != "file"
+                    or content.get("path") != path
+                    or content.get("submodule_git_url")
+                    or content.get("target")
+                ):
+                    raise DomainError(
+                        "source_unbound",
+                        "A source path is not a regular file at the selected commit",
+                        409,
+                    )
+                bindings.append(SourceBinding(path=path, blob_sha=content["sha"]))
+            return tuple(bindings)
+        except (ValueError, KeyError, ValidationError, AttributeError):
+            raise DomainError(
+                "source_unbound", "GitHub source binding could not be verified", 409
+            ) from None

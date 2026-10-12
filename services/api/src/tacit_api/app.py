@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -17,9 +17,13 @@ from tacit_contracts.models import (
     ContextRequest,
     ContextResponse,
     DevicePoll,
+    DraftRequest,
+    DraftView,
     ErrorResponse,
     EvaluationResponse,
     InvitationRequest,
+    PublicationRequest,
+    PublicationResponse,
     QuestionRequest,
     RoleChange,
     ScenarioRequest,
@@ -28,10 +32,18 @@ from tacit_domain.access import DomainError, Principal
 from tacit_domain.knowledge import KnowledgeService
 
 from tacit_api.access import AccessService
-from tacit_api.db import Credential, Installation, Membership, RoleAssignment
+from tacit_api.db import (
+    Credential,
+    Installation,
+    Membership,
+    PublicationReceipt,
+    RoleAssignment,
+    TeachingDraft,
+)
 from tacit_api.demo import DemoStore, demo_principals
 from tacit_api.github import GitHub, verify_webhook
 from tacit_api.persistence import PostgreSQLStore
+from tacit_api.publication import PublicationService
 from tacit_api.webhooks import ingest
 
 
@@ -169,6 +181,8 @@ def create_app(
             with Session(engine) as db:
                 db.execute(select(Credential.token_hash).limit(1))
                 db.execute(select(Installation.github_id).limit(1))
+                db.execute(select(TeachingDraft.id).limit(1))
+                db.execute(select(PublicationReceipt.operation_id).limit(1))
         return {"status": "ready", "persistence": "postgresql"}
 
     @app.get("/v1/auth/me")
@@ -231,25 +245,69 @@ def create_app(
             "repository_id": rid,
             "source_commit": snap.source_commit,
             "revision_ids": [d.revision_id for d in snap.decisions],
+            "parent_snapshot_id": snap.parent_snapshot_id,
+            "manifest_digest": snap.manifest_digest,
         }
 
     @app.get("/v1/repos/{rid}/decisions/{did}/history")
     def history(
-        rid: str, did: str, snapshot_id: str, p: Principal = Depends(principal)
+        rid: str,
+        did: str,
+        snapshot_id: str,
+        cursor: int = Query(0, ge=0, le=1000),
+        limit: int = Query(20, ge=1, le=100),
+        p: Principal = Depends(principal),
     ) -> list[dict[str, object]]:
-        _, snap = knowledge().snapshot(p, rid, snapshot_id)
-        decisions = [d.model_dump(mode="json") for d in snap.decisions if d.id == did]
-        if not decisions:
-            raise DomainError("not_found", "Decision unavailable", 404)
-        return decisions
+        return [
+            d.model_dump(mode="json")
+            for d in knowledge().history(p, rid, snapshot_id, did, cursor, limit)
+        ]
 
-    @app.post("/v1/repos/{rid}/teaching-sessions")
-    @app.post("/v1/repos/{rid}/publications")
-    def authoring(rid: str, p: Principal = Depends(principal)) -> None:
+    def maintainer(rid: str, p: Principal = Depends(principal)) -> Principal:
         knowledge().repository(p, rid, write=True)
-        raise DomainError(
-            "not_implemented", "Teaching and transactional publication are not implemented", 501
-        )
+        return p
+
+    def publications() -> PublicationService:
+        if settings.demo:
+            raise DomainError(
+                "not_implemented", "Publication is available only with PostgreSQL persistence", 501
+            )
+        return PublicationService(access_management())
+
+    @app.get("/v1/repos/{rid}/head")
+    def head(rid: str, p: Principal = Depends(principal)) -> dict[str, object]:
+        knowledge().repository(p, rid)
+        return publications().head(p, rid)
+
+    @app.post("/v1/repos/{rid}/teaching-sessions", response_model=DraftView)
+    def draft(
+        rid: str,
+        request: Request,
+        body: DraftRequest | None = None,
+        p: Principal = Depends(maintainer),
+    ) -> DraftView:
+        manager = publications()
+        if body is None:
+            raise DomainError("unsupported_schema", "A source-bound text draft is required", 422)
+        return manager.create(p, rid, request.headers["Authorization"].split(" ", 1)[1], body)
+
+    @app.get("/v1/repos/{rid}/teaching-sessions/{draft_id}", response_model=DraftView)
+    def review(rid: str, draft_id: str, p: Principal = Depends(maintainer)) -> DraftView:
+        return publications().review(p, rid, draft_id)
+
+    @app.post("/v1/repos/{rid}/publications", response_model=PublicationResponse)
+    def publish(
+        rid: str,
+        request: Request,
+        body: PublicationRequest | None = None,
+        p: Principal = Depends(maintainer),
+    ) -> PublicationResponse:
+        manager = publications()
+        if body is None:
+            raise DomainError(
+                "unsupported_schema", "An explicit reviewed confirmation is required", 422
+            )
+        return manager.publish(p, rid, request.headers["Authorization"].split(" ", 1)[1], body)
 
     @app.post("/v1/auth/device/start")
     def device_start() -> dict[str, object]:

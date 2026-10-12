@@ -89,13 +89,13 @@ def create_server() -> FastMCP:
 
     @server.tool(annotations=read_only)
     def get_decision_history(
-        repository_id: str, decision_id: str, snapshot_id: str
+        repository_id: str, decision_id: str, snapshot_id: str, cursor: int = 0, limit: int = 20
     ) -> list[Decision]:
-        """Read confirmed decision revisions from the requested snapshot."""
+        """Read revision history up to the selected snapshot, newest first; paginate with cursor/limit."""
         return TypeAdapter(list[Decision]).validate_python(
             request(
                 "GET",
-                f"/v1/repos/{escape(repository_id)}/decisions/{escape(decision_id)}/history?snapshot_id={escape(snapshot_id)}",
+                f"/v1/repos/{escape(repository_id)}/decisions/{escape(decision_id)}/history?snapshot_id={escape(snapshot_id)}&cursor={cursor}&limit={limit}",
             )
         )
 

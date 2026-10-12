@@ -79,10 +79,19 @@ class DecisionRevision(Base):
     repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     decision_id: Mapped[str] = mapped_column(String(64))
+    parent_revision_id: Mapped[str | None] = mapped_column(String(64))
     confirmed_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     content: Mapped[dict[str, object]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "parent_revision_id"],
+            [
+                "decision_revisions.workspace_id",
+                "decision_revisions.repository_id",
+                "decision_revisions.id",
+            ],
+        ),
         ForeignKeyConstraint(
             ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
         ),
@@ -95,8 +104,13 @@ class Snapshot(Base):
     repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_commit: Mapped[str] = mapped_column(String(64))
+    parent_snapshot_id: Mapped[str | None] = mapped_column(String(64))
     digest: Mapped[str] = mapped_column(String(64))
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "parent_snapshot_id"],
+            ["snapshots.workspace_id", "snapshots.repository_id", "snapshots.id"],
+        ),
         ForeignKeyConstraint(
             ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
         ),
@@ -207,3 +221,40 @@ class WebhookDelivery(Base):
     event: Mapped[str] = mapped_column(String(64))
     body_hash: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TeachingDraft(Base):
+    __tablename__ = "teaching_drafts"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    operation_id: Mapped[str] = mapped_column(String(128))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("repository_id", "author_id", "operation_id", name="draft_operation"),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class PublicationReceipt(Base):
+    __tablename__ = "publication_receipts"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    draft_id: Mapped[str] = mapped_column(String(64))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    result: Mapped[dict[str, object]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("repository_id", "draft_id", name="draft_published_once"),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "draft_id"],
+            ["teaching_drafts.workspace_id", "teaching_drafts.repository_id", "teaching_drafts.id"],
+        ),
+    )
