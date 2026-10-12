@@ -1,7 +1,6 @@
-import os
-from urllib.parse import urlparse
-
 import httpx
+
+from tacit_client.credentials import CredentialError, api_url, load_token
 
 
 class ClientError(RuntimeError):
@@ -10,19 +9,15 @@ class ClientError(RuntimeError):
 
 class TacitClient:
     def __init__(self, *, agent: bool = False, transport: httpx.BaseTransport | None = None):
-        token = os.environ.get("TACIT_AGENT_TOKEN" if agent else "TACIT_TOKEN", "")
+        token = load_token(agent)
         if not token:
             raise ClientError(
                 "Set an explicit Tacit credential; agent mode requires TACIT_AGENT_TOKEN"
             )
-        url = os.environ.get("TACIT_API_URL", "http://127.0.0.1:8000")
-        parsed = urlparse(url)
-        if parsed.scheme != "https" and not (
-            parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-        ):
-            raise ClientError("Credentials require HTTPS except on loopback")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ClientError("API URL must not contain credentials, query or fragment")
+        try:
+            url = api_url()
+        except CredentialError as exc:
+            raise ClientError(str(exc)) from None
         self.http = httpx.Client(
             base_url=url.rstrip("/"),
             headers={"Authorization": f"Bearer {token}"},

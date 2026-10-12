@@ -1,12 +1,21 @@
 import json
 import platform
+import time
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
+import httpx
 import typer
 from tacit_client.client import ClientError, TacitClient
-from tacit_contracts.models import ContextRequest, QuestionRequest, ScenarioRequest
+from tacit_client.credentials import (
+    CredentialError,
+    api_url,
+    delete_token,
+    save_token,
+    secure_backend,
+)
+from tacit_contracts.models import ContextRequest, QuestionRequest, Role, ScenarioRequest
 
 RepoOption = Annotated[str, typer.Option("--repo")]
 SnapshotOption = Annotated[str, typer.Option("--snapshot")]
@@ -15,8 +24,12 @@ CommitOption = Annotated[str, typer.Option("--commit")]
 app = typer.Typer(help="Tacit: source-bound project intent. Working command; not a public release.")
 workspaces = typer.Typer()
 repos = typer.Typer()
+roles = typer.Typer()
+members = typer.Typer()
 app.add_typer(workspaces, name="workspaces")
 app.add_typer(repos, name="repos")
+app.add_typer(roles, name="roles")
+app.add_typer(members, name="members")
 
 
 def run(method: str, path: str, *, agent: bool = False, body: object = None) -> None:
@@ -130,9 +143,9 @@ def doctor() -> None:
         json.dumps(
             {
                 "python": platform.python_version(),
-                "credential_mode": "explicit environment",
+                "credential_mode": "OS keyring or explicit environment",
                 "audio": "not implemented",
-                "production_auth": "not implemented",
+                "production_auth": "GitHub device flow; backend configuration required",
             },
             indent=2,
         )
@@ -141,11 +154,117 @@ def doctor() -> None:
 
 @app.command()
 def login() -> None:
-    typer.echo(
-        "GitHub pairing is not implemented. See development.md for synthetic demo credentials.",
-        err=True,
+    """Pair through GitHub, then store only the Tacit credential in the OS keyring."""
+    try:
+        secure_backend()
+        with httpx.Client(
+            base_url=api_url(), timeout=30, trust_env=False, follow_redirects=False
+        ) as http:
+            response = http.post("/v1/auth/device/start")
+            response.raise_for_status()
+            pairing = response.json()
+            typer.echo(f"Open {pairing['verification_uri']} and enter {pairing['user_code']}")
+            deadline = time.monotonic() + pairing["expires_in"]
+            interval = pairing["interval"]
+            while time.monotonic() < deadline:
+                time.sleep(interval)
+                response = http.post(
+                    "/v1/auth/device/poll", json={"pairing_token": pairing["pairing_token"]}
+                )
+                response.raise_for_status()
+                result = response.json()
+                if result["status"] == "authorized":
+                    try:
+                        save_token(result["token"])
+                    except CredentialError:
+                        http.post(
+                            "/v1/auth/logout",
+                            headers={"Authorization": "Bearer " + result["token"]},
+                        )
+                        raise
+                    typer.echo("Signed in. Tacit credential saved in the OS keyring.")
+                    return
+                if result["status"] != "pending":
+                    raise CredentialError("GitHub authorization was denied")
+                interval = result["interval"]
+            raise CredentialError("GitHub pairing expired; run tacit login again")
+    except (CredentialError, httpx.HTTPError, ValueError, KeyError) as exc:
+        message = (
+            str(exc)
+            if isinstance(exc, CredentialError)
+            else "GitHub pairing failed; check backend configuration/connectivity"
+        )
+        typer.echo(message, err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command()
+def logout() -> None:
+    try:
+        with TacitClient() as client:
+            client.request("POST", "/v1/auth/logout")
+        delete_token()
+        typer.echo("Credential revoked. Remove TACIT_TOKEN from your environment if set.")
+    except (ClientError, CredentialError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command("agent-token")
+def agent_token(repo: Annotated[list[str], typer.Option("--repo")], expires_in: int = 3600) -> None:
+    """Issue a read-only token; stdout contains the secret for intentional secure capture."""
+    run("POST", "/v1/auth/agent-tokens", body={"repository_ids": repo, "expires_in": expires_in})
+
+
+@members.command("list")
+def list_members(workspace: Annotated[str, typer.Option("--workspace")]) -> None:
+    run("GET", f"/v1/workspaces/{encoded(workspace)}/members")
+
+
+@members.command("invite")
+def invite_member(
+    github_id: str,
+    workspace: Annotated[str, typer.Option("--workspace")],
+    repo: Annotated[list[str], typer.Option("--repo")],
+) -> None:
+    run(
+        "POST",
+        f"/v1/workspaces/{encoded(workspace)}/invitations",
+        body={"github_id": github_id, "repository_ids": repo},
     )
-    raise typer.Exit(1)
+
+
+@members.command("remove")
+def remove_member(user: str, workspace: Annotated[str, typer.Option("--workspace")]) -> None:
+    run("DELETE", f"/v1/workspaces/{encoded(workspace)}/members/{encoded(user)}")
+
+
+@roles.command("grant")
+def grant_role(
+    user: str,
+    role: Role,
+    workspace: Annotated[str, typer.Option("--workspace")],
+    repo: Annotated[str | None, typer.Option("--repo")] = None,
+) -> None:
+    run(
+        "POST",
+        f"/v1/workspaces/{encoded(workspace)}/roles",
+        body={"user_id": user, "role": role.value, "repository_id": repo},
+    )
+
+
+@roles.command("revoke")
+def revoke_role(
+    user: str,
+    role: Role,
+    workspace: Annotated[str, typer.Option("--workspace")],
+    repo: Annotated[str | None, typer.Option("--repo")] = None,
+) -> None:
+    run(
+        "POST",
+        f"/v1/workspaces/{encoded(workspace)}/roles/revoke",
+        body={"user_id": user, "role": role.value, "repository_id": repo},
+    )
 
 
 @app.command()

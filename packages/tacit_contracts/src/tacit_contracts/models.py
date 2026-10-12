@@ -105,3 +105,23 @@ class ErrorResponse(Contract):
     message: str
     request_id: str
     retryable: bool = False
+
+
+class DevicePoll(Contract):
+    pairing_token: str = Field(min_length=32, max_length=256)
+
+
+class RoleChange(Contract):
+    user_id: str = Field(min_length=1, max_length=64)
+    role: Role
+    repository_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class InvitationRequest(Contract):
+    github_id: str = Field(pattern=r"^[0-9]+$", max_length=32)
+    repository_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+
+
+class AgentTokenRequest(Contract):
+    repository_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+    expires_in: int = Field(default=3600, ge=60, le=28800)

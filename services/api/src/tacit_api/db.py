@@ -1,4 +1,4 @@
-"""Initial PostgreSQL schema. Runtime repository adapter is intentionally not wired yet."""
+"""PostgreSQL authority for access and confirmed knowledge."""
 
 from datetime import datetime
 
@@ -41,12 +41,15 @@ class Repository(Base):
     github_id: Mapped[str] = mapped_column(String(32), unique=True)
     full_name: Mapped[str] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    __table_args__ = (UniqueConstraint("id", name="repository_global_id"),)
 
 
 class Membership(Base):
     __tablename__ = "memberships"
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    invited: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
 
 class RoleAssignment(Base):
@@ -156,4 +159,51 @@ class AuditEvent(Base):
     actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     action: Mapped[str] = mapped_column(String(100))
     details: Mapped[dict[str, object]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Installation(Base):
+    __tablename__ = "installations"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    github_id: Mapped[str] = mapped_column(String(32), unique=True)
+    owner_login: Mapped[str] = mapped_column(String(255))
+    owner_type: Mapped[str] = mapped_column(String(32))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Credential(Base):
+    __tablename__ = "credentials"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    agent: Mapped[bool] = mapped_column(Boolean, default=False)
+    parent_hash: Mapped[str | None] = mapped_column(ForeignKey("credentials.token_hash"))
+    repository_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    provider_token: Mapped[str | None] = mapped_column(String(4096))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class DevicePairing(Base):
+    __tablename__ = "device_pairings"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    device_code: Mapped[str] = mapped_column(String(4096))
+    interval: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Invitation(Base):
+    __tablename__ = "invitations"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    github_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    repository_ids: Mapped[list[str]] = mapped_column(JSON)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WebhookDelivery(Base):
+    __tablename__ = "webhook_deliveries"
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    event: Mapped[str] = mapped_column(String(64))
+    body_hash: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
