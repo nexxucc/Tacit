@@ -134,6 +134,21 @@ class AgentTokenRequest(Contract):
     expires_in: int = Field(default=3600, ge=60, le=28800)
 
 
+class VoiceEvidence(Contract):
+    original_transcript: str = Field(min_length=1, max_length=120000)
+    audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    audio_format: Literal["wav", "pcm_s16le"] = "wav"
+    language: str = Field(min_length=2, max_length=32)
+    duration_seconds: float = Field(gt=0, le=900)
+    operation_id: str | None = None
+    session_id: str | None = None
+    segments: tuple[dict[str, StrictStr | StrictInt], ...] = ()
+    original_draft_id: str | None = None
+    corrected: bool = False
+    capture_complete: bool = True
+    transcription_complete: bool = True
+
+
 class DraftRequest(Contract):
     operation_id: str = Field(min_length=1, max_length=128)
     statement: str = Field(min_length=1, max_length=8000)
@@ -142,6 +157,8 @@ class DraftRequest(Contract):
     expected_snapshot_id: str | None
     decision_id: str | None = Field(default=None, min_length=1, max_length=64)
     rule: Rule | None = None
+    transcript_draft_id: str | None = Field(default=None, min_length=1, max_length=64)
+    transcript_operation_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("files")
     @classmethod
@@ -168,6 +185,22 @@ class DraftRequest(Contract):
         return value
 
 
+class VoiceRequest(Contract):
+    operation_id: str = Field(min_length=1, max_length=128)
+    audio_base64: str = Field(min_length=1, max_length=1282000)
+    language: Literal[
+        "bn-IN", "en-IN", "gu-IN", "hi-IN", "kn-IN", "ml-IN", "mr-IN", "pa-IN", "ta-IN", "te-IN"
+    ] = "en-IN"
+    source_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    files: tuple[str, ...] = Field(min_length=1, max_length=20)
+    expected_snapshot_id: str | None
+
+    @field_validator("files")
+    @classmethod
+    def valid_files(cls, files: tuple[str, ...]) -> tuple[str, ...]:
+        return DraftRequest.valid_files(files)
+
+
 class DraftView(Contract):
     id: str
     workspace_id: str
@@ -180,6 +213,7 @@ class DraftView(Contract):
     sources: tuple[SourceBinding, ...]
     rule: Rule | None = None
     previous: Decision | None = None
+    voice: VoiceEvidence | None = None
     review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: Literal["ready_for_review", "published"] = "ready_for_review"
     published_snapshot_id: str | None = None
@@ -200,3 +234,46 @@ class PublicationResponse(Contract):
     source_commit: str
     manifest_digest: str
     parent_snapshot_id: str | None
+
+
+class VoiceSessionRequest(Contract):
+    operation_id: str = Field(min_length=1, max_length=128)
+    language: Literal[
+        "bn-IN", "en-IN", "gu-IN", "hi-IN", "kn-IN", "ml-IN", "mr-IN", "pa-IN", "ta-IN", "te-IN"
+    ] = "en-IN"
+    source_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    files: tuple[str, ...] = Field(min_length=1, max_length=20)
+    expected_snapshot_id: str | None
+
+    @field_validator("files")
+    @classmethod
+    def valid_files(cls, files: tuple[str, ...]) -> tuple[str, ...]:
+        return DraftRequest.valid_files(files)
+
+
+class VoiceFinishRequest(Contract):
+    capture_complete: bool = True
+    chunks: int = Field(ge=1, le=900)
+    audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class VoiceSessionView(Contract):
+    id: str
+    operation_id: str
+    repository_id: str
+    status: Literal[
+        "uploading",
+        "ready",
+        "processing",
+        "completed",
+        "uncertain",
+        "needs_correction",
+        "cancelled",
+        "expired",
+    ]
+    chunks: int
+    pcm_bytes: int
+    capture_complete: bool = False
+    audio_sha256: str | None = None
+    expires_at: str
+    draft: DraftView | None = None

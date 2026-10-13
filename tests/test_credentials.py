@@ -101,3 +101,12 @@ def test_keyring_origin_is_used_for_storage_and_lookup(monkeypatch):
     monkeypatch.setenv("TACIT_API_URL", "https://one.example")
     delete_token()
     assert load_token(False) == ""
+
+
+@pytest.mark.parametrize(
+    "url", ["https://", "https://host:bad", "https://host:99999", "http://[broken"]
+)
+def test_invalid_api_address_is_a_safe_configuration_error(monkeypatch, url):
+    monkeypatch.setenv("TACIT_API_URL", url)
+    with pytest.raises(CredentialError):
+        api_url()

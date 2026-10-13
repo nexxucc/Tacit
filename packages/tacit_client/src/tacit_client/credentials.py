@@ -13,7 +13,12 @@ class CredentialError(RuntimeError):
 
 def api_url() -> str:
     url = os.environ.get("TACIT_API_URL", "http://127.0.0.1:8000").rstrip("/")
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        if not parsed.hostname or parsed.port == 0:
+            raise ValueError
+    except ValueError:
+        raise CredentialError("API URL requires a valid hostname and port") from None
     if parsed.scheme != "https" and not (
         parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
     ):

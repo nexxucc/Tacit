@@ -1,7 +1,13 @@
+import array
+import base64
+import io
 import json
+import math
+import os
 import platform
 import sys
 import time
+import wave
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Annotated
@@ -27,7 +33,13 @@ from tacit_contracts.models import (
     Role,
     Rule,
     ScenarioRequest,
+    VoiceRequest,
+    VoiceSessionRequest,
 )
+
+from tacit_cli.audio import AudioError, devices, record
+from tacit_cli.spool import Spool, sessions
+from tacit_cli.voice_pipeline import record_session, resume
 
 RepoOption = Annotated[str, typer.Option("--repo")]
 SnapshotOption = Annotated[str, typer.Option("--snapshot")]
@@ -38,6 +50,12 @@ workspaces = typer.Typer()
 repos = typer.Typer()
 roles = typer.Typer()
 members = typer.Typer()
+audio = typer.Typer(help="Arch microphone diagnostics; no provider calls.")
+app.add_typer(audio, name="audio")
+voice = typer.Typer(
+    help="Recover or cancel retained voice recordings; never automatically publish."
+)
+app.add_typer(voice, name="voice")
 app.add_typer(workspaces, name="workspaces")
 app.add_typer(repos, name="repos")
 app.add_typer(roles, name="roles")
@@ -163,7 +181,7 @@ def doctor() -> None:
             {
                 "python": platform.python_version(),
                 "credential_mode": "OS keyring or explicit environment",
-                "audio": "not implemented",
+                "audio": "Arch PortAudio; install audio extra and run tacit audio devices",
                 "production_auth": "GitHub device flow; backend configuration required",
             },
             indent=2,
@@ -305,6 +323,14 @@ def teach(
         ),
     ] = None,
     operation_id: Annotated[str | None, typer.Option("--operation-id")] = None,
+    transcript_operation: Annotated[str | None, typer.Option("--transcript-operation")] = None,
+    transcript_draft: Annotated[
+        str | None,
+        typer.Option(
+            "--transcript-draft",
+            help="Correct a voice draft while retaining its original transcript",
+        ),
+    ] = None,
 ) -> None:
     """Create a source-bound teaching draft. This command never publishes."""
     operation = operation_id or str(uuid4())
@@ -327,6 +353,8 @@ def teach(
                 expected_snapshot_id=base,
                 decision_id=decision,
                 rule=rule,
+                transcript_draft_id=transcript_draft,
+                transcript_operation_id=transcript_operation,
             )
             typer.echo(
                 f"Draft operation ID: {operation}; expected snapshot: {base or 'none'} (reuse both with the same input on retry)",
@@ -341,6 +369,249 @@ def teach(
     except (ClientError, OSError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
+
+
+@audio.command("devices")
+def audio_devices() -> None:
+    try:
+        typer.echo(json.dumps(devices(), indent=2))
+    except AudioError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@audio.command("test")
+def audio_test(
+    seconds: Annotated[float, typer.Option(min=1, max=60)] = 5,
+    device: int | None = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Save a private WAV for local playback; never uploads"),
+    ] = None,
+) -> None:
+    """Capture locally; optionally save a private WAV. No upload or transcription."""
+    try:
+        typer.echo("Recording: Enter stops; Ctrl+C cancels. Audio will be discarded.", err=True)
+        clip = record(seconds, device)
+        with wave.open(io.BytesIO(clip), "rb") as wav:
+            samples = array.array("h", wav.readframes(wav.getnframes()))
+        if sys.byteorder != "little":
+            samples.byteswap()
+        rms = math.sqrt(sum(float(v) * v for v in samples) / len(samples)) / 32768 if samples else 0
+        if output:
+            fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as file:
+                file.write(clip)
+        typer.echo(
+            json.dumps(
+                {
+                    "wav_bytes": len(clip),
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "uploaded": False,
+                    "rms": round(rms, 6),
+                    "clipped_samples": sum(abs(v) >= 32760 for v in samples),
+                    "output": str(output) if output else None,
+                }
+            )
+        )
+    except (AudioError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command("teach-voice")
+def teach_voice(
+    repo: RepoOption,
+    commit: CommitOption,
+    source_files: Annotated[list[str], typer.Option("--file")],
+    audio_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--audio-file", help="Existing mono 16 kHz PCM16 WAV; otherwise record microphone"
+        ),
+    ] = None,
+    seconds: Annotated[float, typer.Option(min=1, max=895)] = 30,
+    stream: Annotated[
+        bool,
+        typer.Option(
+            "--stream/--clip",
+            help="Durable sequenced capture/upload; --clip uses the legacy short WAV path",
+        ),
+    ] = True,
+    device: int | None = None,
+    language: str = "en-IN",
+    operation_id: Annotated[str | None, typer.Option("--operation-id")] = None,
+    expected_snapshot: Annotated[str | None, typer.Option("--expected-snapshot")] = None,
+) -> None:
+    """Record/upload recoverable audio and create a private draft; confirmation publishes."""
+    operation = operation_id or str(uuid4())
+    try:
+        with TacitClient() as client:
+            # Establish authenticated access before touching the microphone.
+            capabilities = client.request("GET", f"/v1/repos/{encoded(repo)}/voice-capabilities")
+            if not isinstance(capabilities, dict) or capabilities.get("configured") is not True:
+                raise ClientError(
+                    "Prisma is not configured on the backend; use tacit audio test for local capture"
+                )
+            head = client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+            if not isinstance(head, dict):
+                raise ClientError("Invalid knowledge head response")
+            base = (
+                head.get("snapshot_id")
+                if expected_snapshot is None
+                else (None if expected_snapshot == "none" else expected_snapshot)
+            )
+            if stream or seconds > 30:
+                source = VoiceSessionRequest.model_validate(
+                    {
+                        "operation_id": operation,
+                        "language": language,
+                        "source_commit": commit,
+                        "files": source_files,
+                        "expected_snapshot_id": base,
+                    }
+                )
+                with redirect_stdout(sys.stderr):
+                    if not typer.confirm(
+                        "Record/upload this session and send it to Prisma? Transcription may consume credits.",
+                        err=True,
+                    ):
+                        typer.echo("Cancelled; no recording or transcription started.", err=True)
+                        return
+                durable = record_session(
+                    repo, source, seconds=seconds, device=device, audio_file=audio_file
+                )
+                typer.echo(json.dumps(durable, indent=2))
+                return
+            if audio_file:
+                with audio_file.open("rb") as audio_input:
+                    clip = audio_input.read(961_025)
+                if len(clip) > 961_024:
+                    raise AudioError("Audio file exceeds the short-clip size limit")
+            else:
+                typer.echo("Recording: Enter stops; Ctrl+C cancels before upload.", err=True)
+                clip = record(seconds, device)
+            body = VoiceRequest.model_validate(
+                {
+                    "operation_id": operation,
+                    "audio_base64": base64.b64encode(clip).decode("ascii"),
+                    "language": language,
+                    "source_commit": commit,
+                    "files": tuple(source_files),
+                    "expected_snapshot_id": base,
+                }
+            )
+            typer.echo(
+                f"Voice operation ID: {operation}; expected snapshot: {base or 'none'}. Save both for retries with the same WAV input. Transcription can consume Gnani credits.",
+                err=True,
+            )
+            with redirect_stdout(sys.stderr):
+                if not typer.confirm(
+                    "Send this clip to Prisma to create a reviewable draft?", err=True
+                ):
+                    typer.echo("Cancelled; no audio uploaded.", err=True)
+                    return
+            result = client.request(
+                "POST",
+                f"/v1/repos/{encoded(repo)}/voice-drafts",
+                json=body.model_dump(mode="json"),
+                timeout=120,
+            )
+        typer.echo(json.dumps(result, indent=2))
+    except (ClientError, AudioError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@voice.command("list")
+def voice_list() -> None:
+    try:
+        typer.echo(json.dumps(sessions(), indent=2))
+    except (AudioError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@voice.command("resume")
+def voice_resume(recording: str, accept_partial: bool = False) -> None:
+    try:
+        retained = Spool(recording)
+        typer.echo(
+            f"Repository: {retained.meta['repo']}; recorded seconds: {retained.meta['bytes'] / 32000:.2f}; state: {retained.meta['status']}",
+            err=True,
+        )
+        with redirect_stdout(sys.stderr):
+            if not typer.confirm(
+                "Resume upload/transcription? An unattempted transcription may consume credits.",
+                err=True,
+            ):
+                return
+        typer.echo(json.dumps(resume(retained, accept_partial=accept_partial), indent=2))
+    except (ClientError, AudioError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@voice.command("cancel")
+def voice_cancel(recording: str) -> None:
+    from tacit_cli.voice_pipeline import checked_client, path
+
+    try:
+        retained = Spool(recording)
+        with TacitClient() as client:
+            checked_client(retained, client)
+            if retained.meta["backend_id"]:
+                client.request(
+                    "DELETE", path(retained) + "/" + encoded(str(retained.meta["backend_id"]))
+                )
+        retained.forget()
+        typer.echo(
+            "Retained local/server audio removed. Previously published knowledge is unchanged."
+        )
+    except (ClientError, AudioError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@voice.command("export")
+def voice_export(recording: str, output: Annotated[Path, typer.Option("--output")]) -> None:
+    """Export retained captured audio for local review; never contacts a provider."""
+    try:
+        retained = Spool(recording)
+        if retained.meta["expires_at"] <= time.time():
+            retained.forget()
+            raise AudioError("Local recording retention expired")
+        retained.digest()
+        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as file, wave.open(file, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            for i in range(retained.meta["chunks"]):
+                wav.writeframes(retained.chunk(i))
+        typer.echo(f"Captured audio exported to {output}; interrupted recordings may be partial.")
+    except (AudioError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@voice.command("forget")
+def voice_forget(recording: str) -> None:
+    """Delete only local retained audio; backend retention/cancellation is separate."""
+    try:
+        retained = Spool(recording)
+        retained.forget()
+        typer.echo("Local recording removed; backend audio follows its retention policy.")
+    except (AudioError, OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command()
+def transcript(operation: str, repo: RepoOption) -> None:
+    """Retrieve your immutable original transcript, including after a draft conflict."""
+    run("GET", f"/v1/repos/{encoded(repo)}/voice-transcripts/{encoded(operation)}")
 
 
 @app.command()

@@ -1,4 +1,10 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
 import httpx
+from websockets.exceptions import WebSocketException
+from websockets.sync.client import connect
 
 from tacit_client.credentials import CredentialError, api_url, load_token
 
@@ -43,12 +49,41 @@ class TacitClient:
             return response.json()
         except httpx.HTTPStatusError as exc:
             try:
-                code = exc.response.json().get("code", "request_failed")
+                payload = exc.response.json()
+                code = (
+                    payload.get("code", "request_failed")
+                    if isinstance(payload, dict)
+                    else "request_failed"
+                )
+                if (
+                    not isinstance(code, str)
+                    or not code.replace("_", "").isalnum()
+                    or len(code) > 80
+                ):
+                    code = "request_failed"
             except ValueError:
                 code = "request_failed"
             raise ClientError(f"API error: {code} ({exc.response.status_code})") from None
+        except ValueError:
+            raise ClientError("Invalid JSON response from the Tacit API") from None
         except httpx.HTTPError:
             raise ClientError("Cannot reach the Tacit API") from None
+
+    @contextmanager
+    def voice_socket(self, path: str) -> Iterator[Any]:
+        url = str(self.http.base_url).rstrip("/")
+        url = url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        try:
+            with connect(
+                url + path,
+                additional_headers={"Authorization": self.http.headers["Authorization"]},
+                open_timeout=10,
+                max_size=65536,
+                proxy=None,
+            ) as socket:
+                yield socket
+        except (OSError, TimeoutError, WebSocketException) as exc:
+            raise ClientError("Voice upload disconnected; local audio retained") from exc
 
     def close(self) -> None:
         self.http.close()

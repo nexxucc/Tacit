@@ -2,7 +2,7 @@
 name = "tacit-client"
 version = "0.1.0"
 requires-python = ">=3.12,<3.15"
-dependencies = ['tacit-contracts', 'httpx>=0.28,<1', 'keyring>=25,<26']
+dependencies = ['tacit-contracts', 'httpx>=0.28,<1', 'websockets>=15,<17', 'keyring>=25,<26']
 
 
 [build-system]

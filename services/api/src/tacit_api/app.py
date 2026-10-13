@@ -1,11 +1,14 @@
+import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -27,6 +30,10 @@ from tacit_contracts.models import (
     QuestionRequest,
     RoleChange,
     ScenarioRequest,
+    VoiceFinishRequest,
+    VoiceRequest,
+    VoiceSessionRequest,
+    VoiceSessionView,
 )
 from tacit_domain.access import DomainError, Principal
 from tacit_domain.knowledge import KnowledgeService
@@ -39,11 +46,18 @@ from tacit_api.db import (
     PublicationReceipt,
     RoleAssignment,
     TeachingDraft,
+    VoiceAttempt,
+    VoiceChunk,
+    VoiceSession,
+    VoiceTranscript,
 )
 from tacit_api.demo import DemoStore, demo_principals
 from tacit_api.github import GitHub, verify_webhook
 from tacit_api.persistence import PostgreSQLStore
+from tacit_api.providers import SpeechToText
 from tacit_api.publication import PublicationService
+from tacit_api.voice import MAX_REQUEST_BYTES, Prisma, VoiceService
+from tacit_api.voice_sessions import CHUNK_BYTES, VoiceSessions
 from tacit_api.webhooks import ingest
 
 
@@ -57,6 +71,8 @@ class Settings(BaseSettings):
     github_client_id: str = ""
     github_app_id: int = 0
     credential_encryption_key: str = ""
+    gnani_api_key: str = ""
+    voice_retention_seconds: int = 86400
 
 
 def create_app(
@@ -64,8 +80,11 @@ def create_app(
     *,
     github: GitHub | None = None,
     database: Engine | None = None,
+    speech: SpeechToText | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
+    if not 60 <= settings.voice_retention_seconds <= 604800:
+        raise ValueError("Voice retention must be between one minute and seven days")
     engine = database or (
         create_engine(settings.database_url, pool_pre_ping=True)
         if settings.database_url and not settings.demo
@@ -88,7 +107,32 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        yield
+        async def cleanup() -> None:
+            while True:
+                if access is not None:
+                    try:
+                        await run_in_threadpool(
+                            VoiceSessions(
+                                PublicationService(access),
+                                speech or Prisma(settings.gnani_api_key),
+                                settings.voice_retention_seconds,
+                            ).prune
+                        )
+                    except SQLAlchemyError:
+                        # Readiness reports missing migrations; cleanup retries after recovery.
+                        pass
+                await asyncio.sleep(60)
+
+        cleanup_task = asyncio.create_task(cleanup()) if access is not None else None
+        try:
+            yield
+        finally:
+            if cleanup_task:
+                cleanup_task.cancel()
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:
+                    pass
         if engine is not None and database is None:
             engine.dispose()
 
@@ -182,6 +226,10 @@ def create_app(
                 db.execute(select(Credential.token_hash).limit(1))
                 db.execute(select(Installation.github_id).limit(1))
                 db.execute(select(TeachingDraft.id).limit(1))
+                db.execute(select(VoiceAttempt.operation_id).limit(1))
+                db.execute(select(VoiceTranscript.operation_id).limit(1))
+                db.execute(select(VoiceSession.id).limit(1))
+                db.execute(select(VoiceChunk.sequence).limit(1))
                 db.execute(select(PublicationReceipt.operation_id).limit(1))
         return {"status": "ready", "persistence": "postgresql"}
 
@@ -290,6 +338,168 @@ def create_app(
         if body is None:
             raise DomainError("unsupported_schema", "A source-bound text draft is required", 422)
         return manager.create(p, rid, request.headers["Authorization"].split(" ", 1)[1], body)
+
+    def voice_sessions() -> VoiceSessions:
+        return VoiceSessions(
+            publications(),
+            speech if speech is not None else Prisma(settings.gnani_api_key),
+            settings.voice_retention_seconds,
+        )
+
+    def request_token(request: Request) -> str:
+        return request.headers["Authorization"].split(" ", 1)[1]
+
+    @app.post("/v1/repos/{rid}/voice-sessions", response_model=VoiceSessionView)
+    def start_voice_session(
+        rid: str, body: VoiceSessionRequest, request: Request, p: Principal = Depends(maintainer)
+    ) -> VoiceSessionView:
+        return voice_sessions().start(p, rid, request_token(request), body)
+
+    @app.get("/v1/repos/{rid}/voice-sessions/{sid}", response_model=VoiceSessionView)
+    def get_voice_session(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> VoiceSessionView:
+        return voice_sessions().get(p, rid, request_token(request), sid)
+
+    @app.put(
+        "/v1/repos/{rid}/voice-sessions/{sid}/chunks/{sequence}", response_model=VoiceSessionView
+    )
+    async def voice_chunk(
+        rid: str, sid: str, sequence: int, request: Request, p: Principal = Depends(maintainer)
+    ) -> VoiceSessionView:
+        pcm = bytearray()
+        async for data in request.stream():
+            if len(pcm) + len(data) > CHUNK_BYTES:
+                raise DomainError("audio_too_large", "Audio chunk exceeds one second", 413)
+            pcm.extend(data)
+        return await run_in_threadpool(
+            voice_sessions().append, p, rid, request_token(request), sid, sequence, bytes(pcm)
+        )
+
+    @app.websocket("/v1/repos/{rid}/voice-sessions/{sid}/upload")
+    async def voice_upload(socket: WebSocket, rid: str, sid: str) -> None:
+        token = socket.headers.get("Authorization", "").removeprefix("Bearer ")
+        try:
+            manager = voice_sessions()
+            p = await run_in_threadpool(access_management().principal, token)
+            view = await run_in_threadpool(manager.get, p, rid, token, sid)
+        except DomainError:
+            await socket.close(code=1008)
+            return
+        await socket.accept()
+        await socket.send_json(view.model_dump(mode="json"))
+        checked = time.monotonic()
+        try:
+            while True:
+                message = await asyncio.wait_for(socket.receive(), 20)
+                if message["type"] == "websocket.disconnect":
+                    return
+                packet = message.get("bytes")
+                if not isinstance(packet, bytes):
+                    raise DomainError("invalid_audio_chunk", "Binary audio packet required", 422)
+                if len(packet) <= 8 or len(packet) > CHUNK_BYTES + 8:
+                    raise DomainError("invalid_audio_chunk", "Invalid sequenced audio packet", 422)
+                if time.monotonic() - checked > 10:
+                    p = await run_in_threadpool(access_management().principal, token)
+                    checked = time.monotonic()
+                view = await run_in_threadpool(
+                    manager.append,
+                    p,
+                    rid,
+                    token,
+                    sid,
+                    int.from_bytes(packet[:8], "big"),
+                    packet[8:],
+                )
+                await socket.send_json(view.model_dump(mode="json"))
+        except DomainError as exc:
+            await socket.send_json({"code": exc.code})
+            await socket.close(code=1008)
+        except TimeoutError:
+            await socket.close(code=1000)
+        except WebSocketDisconnect:
+            return
+
+    @app.post("/v1/repos/{rid}/voice-sessions/{sid}/finish", response_model=VoiceSessionView)
+    def finish_voice_session(
+        rid: str,
+        sid: str,
+        body: VoiceFinishRequest,
+        request: Request,
+        p: Principal = Depends(maintainer),
+    ) -> VoiceSessionView:
+        return voice_sessions().finish(p, rid, request_token(request), sid, body)
+
+    @app.get("/v1/repos/{rid}/voice-sessions/{sid}/audio")
+    def voice_audio(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> Response:
+        return Response(
+            voice_sessions().audio(p, rid, request_token(request), sid),
+            media_type="audio/wav",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.delete("/v1/repos/{rid}/voice-sessions/{sid}", response_model=VoiceSessionView)
+    def cancel_voice_session(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> VoiceSessionView:
+        return voice_sessions().cancel(p, rid, request_token(request), sid)
+
+    @app.post("/v1/repos/{rid}/voice-sessions/{sid}/transcribe", response_model=VoiceSessionView)
+    async def transcribe_voice_session(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> VoiceSessionView:
+        if speech is None and not settings.gnani_api_key:
+            raise DomainError(
+                "provider_unconfigured", "Set TACIT_GNANI_API_KEY on the backend", 503
+            )
+        return await voice_sessions().transcribe(p, rid, request_token(request), sid)
+
+    @app.get("/v1/repos/{rid}/voice-capabilities")
+    def voice_capabilities(rid: str, p: Principal = Depends(maintainer)) -> dict[str, object]:
+        publications()
+        return {
+            "configured": speech is not None or bool(settings.gnani_api_key),
+            "max_seconds": 895,
+            "rest_max_seconds": 30,
+            "upload": "sequenced PCM; websocket or resumable HTTP",
+            "sample_rate": 16000,
+            "channels": 1,
+            "format": "PCM16 WAV",
+        }
+
+    @app.get("/v1/repos/{rid}/voice-transcripts/{operation}")
+    def voice_transcript(
+        rid: str, operation: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> dict[str, object]:
+        token = request.headers["Authorization"].split(" ", 1)[1]
+        return VoiceService(publications(), Prisma("")).transcript(p, rid, token, operation)
+
+    @app.post("/v1/repos/{rid}/voice-drafts", response_model=DraftView)
+    async def voice_draft(
+        rid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> DraftView:
+        provider = speech if speech is not None else Prisma(settings.gnani_api_key)
+        if isinstance(provider, Prisma) and not provider.key:
+            raise DomainError(
+                "provider_unconfigured", "Set TACIT_GNANI_API_KEY on the backend", 503
+            )
+        content = bytearray()
+        async for chunk in request.stream():
+            if len(content) + len(chunk) > MAX_REQUEST_BYTES:
+                raise DomainError(
+                    "audio_too_large", "Voice request exceeds the short-clip limit", 413
+                )
+            content.extend(chunk)
+        try:
+            body = VoiceRequest.model_validate_json(bytes(content))
+        except ValidationError as exc:
+            raise DomainError(
+                "invalid_voice_request", "Invalid voice metadata or audio encoding", 422
+            ) from exc
+        token = request.headers["Authorization"].split(" ", 1)[1]
+        return await VoiceService(publications(), provider).create(p, rid, token, body)
 
     @app.get("/v1/repos/{rid}/teaching-sessions/{draft_id}", response_model=DraftView)
     def review(rid: str, draft_id: str, p: Principal = Depends(maintainer)) -> DraftView:

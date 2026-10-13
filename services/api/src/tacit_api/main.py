@@ -7,4 +7,10 @@ def main() -> None:
     settings = Settings()
     if settings.demo and settings.host not in {"127.0.0.1", "::1", "localhost"}:
         raise SystemExit("Demo mode must bind to loopback")
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+    uvicorn.run(
+        create_app(settings),
+        host=settings.host,
+        port=settings.port,
+        ws_max_size=32768,
+        ws_max_queue=4,
+    )

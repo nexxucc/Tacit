@@ -14,6 +14,7 @@ from tacit_contracts.models import (
     PublicationRequest,
     PublicationResponse,
     Role,
+    VoiceEvidence,
 )
 from tacit_domain.access import DomainError, Grant, Principal, authorize
 
@@ -32,6 +33,9 @@ from tacit_api.db import (
     Snapshot,
     SnapshotMember,
     TeachingDraft,
+    VoiceAttempt,
+    VoiceSession,
+    VoiceTranscript,
     Workspace,
 )
 
@@ -161,11 +165,97 @@ class PublicationService:
             )
         return view
 
-    def create(self, p: Principal, rid: str, token: str, body: DraftRequest) -> DraftView:
-        request_digest = fingerprint(body.model_dump(mode="json"))
+    def create(
+        self,
+        p: Principal,
+        rid: str,
+        token: str,
+        body: DraftRequest,
+        *,
+        voice: VoiceEvidence | None = None,
+    ) -> DraftView:
+        if body.transcript_draft_id and body.transcript_operation_id:
+            raise DomainError("invalid_correction", "Select one original transcript reference", 422)
+        if body.transcript_operation_id:
+            with Session(self.engine) as db, db.begin():
+                repo = self.write_repository(db, p, rid, token)
+                transcript = db.get(
+                    VoiceTranscript,
+                    (repo.workspace_id, rid, p.user_id, body.transcript_operation_id),
+                )
+                if transcript is None:
+                    raise DomainError("not_found", "Original transcript unavailable", 404)
+                source = transcript.payload["request"]
+                assert isinstance(source, dict)
+                if (
+                    body.source_commit != source["source_commit"]
+                    or list(body.files) != source["files"]
+                ):
+                    raise DomainError(
+                        "source_unbound", "Corrections must retain original source bindings", 422
+                    )
+                voice = VoiceEvidence.model_validate(transcript.payload["voice"]).model_copy(
+                    update={
+                        "corrected": body.statement
+                        != VoiceEvidence.model_validate(
+                            transcript.payload["voice"]
+                        ).original_transcript
+                    }
+                )
+        if body.transcript_draft_id:
+            original = self.review(p, rid, body.transcript_draft_id)
+            if original.voice is None or original.author_id != p.user_id:
+                raise DomainError(
+                    "forbidden", "Only the recording author may correct its transcript"
+                )
+            if body.source_commit != original.source_commit or body.files != tuple(
+                s.path for s in original.sources
+            ):
+                raise DomainError(
+                    "source_unbound",
+                    "Transcript corrections must retain their source bindings",
+                    422,
+                )
+            voice = original.voice.model_copy(
+                update={
+                    "original_draft_id": original.voice.original_draft_id or original.id,
+                    "corrected": body.statement != original.voice.original_transcript,
+                }
+            )
+        request_digest = fingerprint(
+            {
+                "request": body.model_dump(mode="json"),
+                "voice": voice.model_dump(mode="json") if voice else None,
+            }
+        )
+        if (
+            voice is None
+            and body.transcript_draft_id is None
+            and body.transcript_operation_id is None
+        ):
+            request_digest = fingerprint(
+                body.model_dump(
+                    mode="json", exclude={"transcript_draft_id", "transcript_operation_id"}
+                )
+            )
         # Authorize before reading drafts or making any provider call.
         with Session(self.engine) as db, db.begin():
             repo = self.write_repository(db, p, rid, token)
+            if voice is None or body.transcript_draft_id or body.transcript_operation_id:
+                for model in (VoiceSession, VoiceAttempt):
+                    reserved = db.scalar(
+                        select(model).where(
+                            model.repository_id == rid,
+                            model.author_id == p.user_id,
+                            model.operation_id == body.operation_id,
+                        )
+                    )
+                    if reserved is not None:
+                        raise DomainError(
+                            "idempotency_conflict",
+                            "Operation ID belongs to a voice recording; use a new ID for text or corrections",
+                            409,
+                        )
             prior = self.existing_draft(db, rid, p.user_id, body.operation_id, request_digest)
             if prior:
                 return self.view(db, prior)
@@ -179,9 +269,37 @@ class PublicationService:
         # Source verification does not hold a database lock. Recheck all local authority now.
         with Session(self.engine) as db, db.begin():
             repo = self.write_repository(db, p, rid, token)
+            if voice is None or body.transcript_draft_id or body.transcript_operation_id:
+                for model in (VoiceSession, VoiceAttempt):
+                    reserved = db.scalar(
+                        select(model).where(
+                            model.repository_id == rid,
+                            model.author_id == p.user_id,
+                            model.operation_id == body.operation_id,
+                        )
+                    )
+                    if reserved is not None:
+                        raise DomainError(
+                            "idempotency_conflict",
+                            "Operation ID belongs to a voice recording; use a new ID for text or corrections",
+                            409,
+                        )
             prior = self.existing_draft(db, rid, p.user_id, body.operation_id, request_digest)
             if prior:
                 return self.view(db, prior)
+            if (
+                voice is not None
+                and voice.session_id is not None
+                and body.transcript_draft_id is None
+                and body.transcript_operation_id is None
+            ):
+                session = db.get(VoiceSession, (repo.workspace_id, rid, voice.session_id))
+                if (
+                    session is None
+                    or session.author_id != p.user_id
+                    or session.status not in {"processing", "completed", "uncertain"}
+                ):
+                    raise DomainError("voice_state", "Voice session was cancelled or expired", 409)
             self.current(db, repo, body.expected_snapshot_id)
             previous = None
             if body.decision_id:
@@ -217,6 +335,7 @@ class PublicationService:
                 sources=sources,
                 rule=body.rule,
                 previous=previous,
+                voice=voice,
                 review_digest="0" * 64,
             )
             payload = view.model_dump(
@@ -302,7 +421,7 @@ class PublicationService:
                         decision_id=view.decision_id,
                         revision_id=revision_id,
                         segment_id=view.id,
-                        kind="text",
+                        kind="transcript" if view.voice else "text",
                     ),
                 ),
                 rule=view.rule,

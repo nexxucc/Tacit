@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    LargeBinary,
     String,
     UniqueConstraint,
     func,
@@ -256,5 +257,86 @@ class PublicationReceipt(Base):
         ForeignKeyConstraint(
             ["workspace_id", "repository_id", "draft_id"],
             ["teaching_drafts.workspace_id", "teaching_drafts.repository_id", "teaching_drafts.id"],
+        ),
+    )
+
+
+class VoiceAttempt(Base):
+    """Durable, immutable at-most-once provider reservation. No raw audio retained."""
+
+    __tablename__ = "voice_attempts"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    request_digest: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class VoiceTranscript(Base):
+    """Immutable provider result, independent of whether draft creation succeeds."""
+
+    __tablename__ = "voice_transcripts"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "author_id", "operation_id"],
+            [
+                "voice_attempts.workspace_id",
+                "voice_attempts.repository_id",
+                "voice_attempts.author_id",
+                "voice_attempts.operation_id",
+            ],
+        ),
+    )
+
+
+class VoiceSession(Base):
+    __tablename__ = "voice_sessions"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    operation_id: Mapped[str] = mapped_column(String(128))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    context: Mapped[dict[str, object]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32), default="uploading")
+    chunks: Mapped[int] = mapped_column(default=0)
+    pcm_bytes: Mapped[int] = mapped_column(default=0)
+    capture_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    audio_sha256: Mapped[str | None] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id", "author_id", "operation_id", name="voice_session_operation"
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class VoiceChunk(Base):
+    __tablename__ = "voice_chunks"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    sequence: Mapped[int] = mapped_column(primary_key=True)
+    sha256: Mapped[str] = mapped_column(String(64))
+    encrypted_pcm: Mapped[bytes] = mapped_column(LargeBinary)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "session_id"],
+            ["voice_sessions.workspace_id", "voice_sessions.repository_id", "voice_sessions.id"],
         ),
     )

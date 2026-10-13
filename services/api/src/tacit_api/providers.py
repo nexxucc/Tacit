@@ -8,7 +8,9 @@ class ProviderUnavailable(RuntimeError):
 
 
 class SpeechToText(Protocol):
-    async def transcribe(self, audio: bytes, sample_rate: int) -> str: ...
+    async def transcribe(
+        self, audio: bytes, sample_rate: int, *, language: str = "en-IN"
+    ) -> str: ...
 
 
 class TextToSpeech(Protocol):
@@ -20,7 +22,7 @@ class TextReasoner(Protocol):
 
 
 class UnconfiguredPrisma:
-    async def transcribe(self, audio: bytes, sample_rate: int) -> str:
+    async def transcribe(self, audio: bytes, sample_rate: int, *, language: str = "en-IN") -> str:
         raise ProviderUnavailable("Prisma transport is not configured")
 
 
