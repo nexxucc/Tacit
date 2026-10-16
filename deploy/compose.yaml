@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: tacit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a database password}
+      POSTGRES_DB: tacit
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tacit"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  migrate:
+    build: ..
+    env_file: ../.env
+    environment:
+      TACIT_DATABASE_URL: postgresql+psycopg://tacit:${POSTGRES_PASSWORD}@postgres:5432/tacit
+    command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    build: ..
+    env_file: ../.env
+    environment:
+      TACIT_HOST: 0.0.0.0
+      TACIT_DATABASE_URL: postgresql+psycopg://tacit:${POSTGRES_PASSWORD}@postgres:5432/tacit
+      TACIT_ARTIFACT_DIRECTORY: /var/lib/tacit/artifacts
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["artifacts:/var/lib/tacit/artifacts"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+  worker:
+    build: ..
+    env_file: ../.env
+    environment:
+      TACIT_DATABASE_URL: postgresql+psycopg://tacit:${POSTGRES_PASSWORD}@postgres:5432/tacit
+      TACIT_ARTIFACT_DIRECTORY: /var/lib/tacit/artifacts
+    volumes: ["artifacts:/var/lib/tacit/artifacts"]
+    command: ["uv", "run", "--no-sync", "tacit-worker"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  artifacts:

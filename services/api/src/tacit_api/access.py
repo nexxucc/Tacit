@@ -2,6 +2,9 @@
 
 import hashlib
 import secrets
+import threading
+import time
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -39,9 +42,16 @@ def valid_time(value: datetime) -> datetime:
 
 
 class AccessService:
-    def __init__(self, engine: Engine, github: GitHub, encryption_key: str):
+    def __init__(
+        self, engine: Engine, github: GitHub, encryption_key: str, read_cache_seconds: int = 0
+    ):
         self.engine, self.github = engine, github
         self.cipher = Fernet(encryption_key.encode())
+        self.read_cache_seconds = max(0, min(60, read_cache_seconds))
+        self._eligibility_cache: OrderedDict[
+            str, tuple[float, tuple[EligibleInstallation, ...]]
+        ] = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     def encrypt(self, value: str) -> str:
         return self.cipher.encrypt(value.encode()).decode()
@@ -232,7 +242,25 @@ class AccessService:
             raise DomainError("unauthenticated", "Credential expired or revoked", 401)
         return row
 
-    def principal(self, token: str) -> Principal:
+    def verified_eligibility(
+        self, provider_token: str, *, fresh: bool = True
+    ) -> tuple[EligibleInstallation, ...]:
+        key = digest(provider_token)
+        if not fresh and self.read_cache_seconds:
+            with self._cache_lock:
+                entry = self._eligibility_cache.get(key)
+                if entry and entry[0] > time.monotonic():
+                    self._eligibility_cache.move_to_end(key)
+                    return entry[1]
+        verified = self.github.eligibility(provider_token)
+        with self._cache_lock:
+            self._eligibility_cache[key] = (time.monotonic() + self.read_cache_seconds, verified)
+            self._eligibility_cache.move_to_end(key)
+            while len(self._eligibility_cache) > 256:
+                self._eligibility_cache.popitem(last=False)
+        return verified
+
+    def principal(self, token: str, *, fresh: bool = True) -> Principal:
         with Session(self.engine) as db, db.begin():
             row = self.credential(db, digest(token))
             parent = self.credential(db, row.parent_hash) if row.agent and row.parent_hash else row
@@ -241,7 +269,7 @@ class AccessService:
             user = db.get(User, row.user_id)
             if user is None or parent.user_id != row.user_id:
                 raise DomainError("unauthenticated", "Invalid credential subject", 401)
-            eligible = self.github.eligibility(self.decrypt(parent.provider_token))
+            eligible = self.verified_eligibility(self.decrypt(parent.provider_token), fresh=fresh)
             self.sync(db, user.id, user.github_id, eligible)
             db.flush()
             memberships: set[str] = set()

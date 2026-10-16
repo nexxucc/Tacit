@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import httpx
 import typer
+from pydantic import TypeAdapter
 from tacit_client.client import ClientError, TacitClient
 from tacit_client.credentials import (
     CredentialError,
@@ -39,6 +40,7 @@ from tacit_contracts.models import (
 
 from tacit_cli.audio import AudioError, devices, record
 from tacit_cli.spool import Spool, sessions
+from tacit_cli.teaching import app as teaching_app
 from tacit_cli.voice_pipeline import record_session, resume
 
 RepoOption = Annotated[str, typer.Option("--repo")]
@@ -52,6 +54,7 @@ roles = typer.Typer()
 members = typer.Typer()
 audio = typer.Typer(help="Arch microphone diagnostics; no provider calls.")
 app.add_typer(audio, name="audio")
+app.add_typer(teaching_app, name="teaching")
 voice = typer.Typer(
     help="Recover or cancel retained voice recordings; never automatically publish."
 )
@@ -62,10 +65,14 @@ app.add_typer(roles, name="roles")
 app.add_typer(members, name="members")
 
 
-def run(method: str, path: str, *, agent: bool = False, body: object = None) -> None:
+def run(
+    method: str, path: str, *, agent: bool = False, body: object = None, timeout: float = 15
+) -> None:
     try:
         with TacitClient(agent=agent) as client:
-            result = client.request(method, path, **({"json": body} if body is not None else {}))
+            result = client.request(
+                method, path, **({"json": body} if body is not None else {}), timeout=timeout
+            )
         typer.echo(json.dumps(result, indent=2))
     except ClientError as exc:
         typer.echo(str(exc), err=True)
@@ -124,13 +131,27 @@ def ask(
     snapshot: SnapshotOption,
     commit: CommitOption,
     agent: bool = False,
+    reason: bool = False,
+    operation_id: str | None = None,
 ) -> None:
-    body = QuestionRequest(snapshot_id=snapshot, source_commit=commit, question=question)
+    operation = operation_id or str(uuid4()) if reason else None
+    if reason:
+        typer.echo(
+            f"Question operation: {operation}; text reasoning may consume model resources", err=True
+        )
+    body = QuestionRequest(
+        snapshot_id=snapshot,
+        source_commit=commit,
+        question=question,
+        reason=reason,
+        operation_id=operation,
+    )
     run(
         "POST",
         f"/v1/repos/{encoded(repo)}/questions",
         agent=agent,
         body=body.model_dump(mode="json"),
+        timeout=150 if reason else 15,
     )
 
 
@@ -143,8 +164,12 @@ def evaluate(
     agent: bool = False,
 ) -> None:
     try:
+        supplied = json.loads(scenario.read_text())
         body = ScenarioRequest(
-            snapshot_id=snapshot, source_commit=commit, facts=json.loads(scenario.read_text())
+            snapshot_id=snapshot,
+            source_commit=commit,
+            facts=supplied.get("facts", supplied),
+            action=supplied.get("action"),
         )
     except (OSError, ValueError) as exc:
         typer.echo(f"Invalid scenario: {exc}", err=True)
@@ -339,7 +364,9 @@ def teach(
         rule = Rule.model_validate_json(rule_file.read_text()) if rule_file else None
         with TacitClient() as client:
             if expected_snapshot is None:
-                head = client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+                head = TypeAdapter(dict[str, str | None]).validate_python(
+                    client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+                )
                 if not isinstance(head, dict):
                     raise ClientError("Invalid knowledge head response")
                 base = head.get("snapshot_id")
@@ -454,7 +481,9 @@ def teach_voice(
                 raise ClientError(
                     "Prisma is not configured on the backend; use tacit audio test for local capture"
                 )
-            head = client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+            head = TypeAdapter(dict[str, str | None]).validate_python(
+                client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+            )
             if not isinstance(head, dict):
                 raise ClientError("Invalid knowledge head response")
             base = (
@@ -676,6 +705,80 @@ def mcp() -> None:
         typer.echo("Install tacit-mcp alongside tacit-cli", err=True)
         raise typer.Exit(1)
     raise typer.Exit(subprocess.call([executable]))
+
+
+@workspaces.command("use")
+def use_workspace(workspace: str) -> None:
+    from tacit_cli.config import save
+
+    try:
+        with TacitClient() as client:
+            eligible = TypeAdapter(list[dict[str, str]]).validate_python(
+                client.request("GET", "/v1/workspaces")
+            )
+        if not any(w["id"] == workspace for w in eligible):
+            raise ClientError("Workspace unavailable")
+        save(workspace)
+        typer.echo("Workspace selection saved for this backend/account.")
+    except (ClientError, ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@repos.command("use")
+def use_repository(repo: str, workspace: Annotated[str, typer.Option("--workspace")]) -> None:
+    from tacit_cli.config import save
+
+    try:
+        with TacitClient() as client:
+            eligible = TypeAdapter(list[dict[str, str]]).validate_python(
+                client.request("GET", f"/v1/workspaces/{encoded(workspace)}/repos")
+            )
+        if not any(r["id"] == repo for r in eligible):
+            raise ClientError("Repository unavailable")
+        save(workspace, repo)
+        typer.echo("Repository selection saved for this backend/account.")
+    except (ClientError, ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command("selected-context")
+def selected_context(commit: CommitOption, snapshot: str | None = None) -> None:
+    from tacit_cli.config import repository
+
+    try:
+        repo = repository()
+        if not repo:
+            raise ClientError("Select a repository with tacit repos use first")
+        with TacitClient() as client:
+            head = TypeAdapter(dict[str, str | None]).validate_python(
+                client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+            )
+        selected = snapshot or head.get("snapshot_id")
+        if not selected:
+            raise ClientError("Repository has no published snapshot")
+        run(
+            "POST",
+            f"/v1/repos/{encoded(repo)}/context",
+            body=ContextRequest(snapshot_id=selected, source_commit=commit).model_dump(mode="json"),
+        )
+    except (ClientError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command("install")
+def installation() -> None:
+    try:
+        with TacitClient() as client:
+            result = TypeAdapter(dict[str, str]).validate_python(
+                client.request("GET", "/v1/install")
+            )
+        typer.echo(result["url"])
+    except (ClientError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
 
 
 def main() -> None:

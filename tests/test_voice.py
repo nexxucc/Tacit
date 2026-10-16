@@ -137,7 +137,9 @@ def test_voice_correction_publication_and_exact_retry(voice_setup):
     ).json()
     assert context["decisions"][0]["statement"] == correction["statement"]
     assert context["evidence"][0]["kind"] == "transcript"
-    assert context["usage"] == dict(stt_calls=0, tts_calls=0, reasoning_calls=0)
+    assert context["usage"] == dict(
+        stt_calls=0, tts_calls=0, reasoning_calls=0, input_tokens=0, output_tokens=0
+    )
     assert speech.calls == 1
     recovered = client.get("/v1/repos/gh-101/voice-transcripts/voice-op", headers=owner)
     assert recovered.status_code == 200

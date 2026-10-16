@@ -9,9 +9,35 @@ DEMO_COMMIT = "demo-commit-1"
 
 class DemoStore:
     def repositories(self) -> tuple[Repository, ...]:
-        return (Repository("scheduler", "demo", "demo/scheduler"),)
+        return (
+            Repository("scheduler", "demo", "demo/scheduler"),
+            Repository("scheduler-second", "demo-second", "demo-second/scheduler"),
+        )
 
     def snapshot(self, repository: str, snapshot: str) -> Snapshot | None:
+        if (repository, snapshot) == ("scheduler-second", "snapshot-second"):
+            return Snapshot(
+                snapshot,
+                repository,
+                DEMO_COMMIT,
+                (
+                    Decision(
+                        id="second-private",
+                        revision_id="second-revision",
+                        statement="Second workspace intent is isolated.",
+                        files=("worker.py",),
+                        source_commit=DEMO_COMMIT,
+                        evidence=(
+                            Evidence(
+                                decision_id="second-private",
+                                revision_id="second-revision",
+                                segment_id="second-evidence",
+                                kind="text",
+                            ),
+                        ),
+                    ),
+                ),
+            )
         if (repository, snapshot) != ("scheduler", "snapshot-1"):
             return None
         decision = Decision(
@@ -56,4 +82,24 @@ def demo_principals() -> dict[str, Principal]:
         "demo-learner": principal(Role.LEARNER),
         "demo-maintainer": principal(Role.MAINTAINER),
         "demo-agent": principal(Role.MAINTAINER, True),
+    }
+
+
+def multi_user_principals() -> dict[str, Principal]:
+    """Distinct synthetic identities for scripted read/denial demonstrations."""
+
+    def user(uid: str, role: Role, second: bool = False) -> Principal:
+        return Principal(
+            uid,
+            False,
+            frozenset({"demo", "demo-second"} if second else {"demo"}),
+            frozenset({"scheduler", "scheduler-second"} if second else {"scheduler"}),
+            (Grant("demo", role),) + ((Grant("demo-second", Role.LEARNER),) if second else ()),
+        )
+
+    return {
+        "demo-maintainer-a": user("maintainer-a", Role.MAINTAINER, True),
+        "demo-maintainer-b": user("maintainer-b", Role.MAINTAINER),
+        "demo-learner-a": user("learner-a", Role.LEARNER),
+        "demo-learner-b": user("learner-b", Role.LEARNER),
     }

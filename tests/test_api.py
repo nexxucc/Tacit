@@ -25,7 +25,13 @@ def test_text_read_and_evaluation_contract() -> None:
         context = c.post("/v1/repos/scheduler/context", json=data)
         assert context.status_code == 200
         assert context.json()["evidence"][0]["segment_id"] == "segment-1"
-        assert context.json()["usage"] == {"stt_calls": 0, "tts_calls": 0, "reasoning_calls": 0}
+        assert context.json()["usage"] == {
+            "stt_calls": 0,
+            "tts_calls": 0,
+            "reasoning_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
         result = c.post(
             "/v1/repos/scheduler/evaluate", json={**data, "facts": {"lease_expired": True}}
         )

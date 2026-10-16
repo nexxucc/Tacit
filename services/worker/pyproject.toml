@@ -2,11 +2,11 @@
 name = "tacit-worker"
 version = "0.1.0"
 requires-python = ">=3.12,<3.15"
-dependencies = ['tacit-domain', 'procrastinate>=3,<4']
+dependencies = ['tacit-api']
 [project.scripts]
 tacit-worker = "tacit_worker.main:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.uv.sources]
-tacit-domain = { workspace = true }
+tacit-api = { workspace = true }

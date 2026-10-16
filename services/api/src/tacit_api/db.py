@@ -1,6 +1,7 @@
 """PostgreSQL authority for access and confirmed knowledge."""
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -164,6 +165,11 @@ class OutboxEvent(Base):
     idempotency_key: Mapped[str] = mapped_column(String(128))
     payload: Mapped[dict[str, object]] = mapped_column(JSON)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64))
     __table_args__ = (UniqueConstraint("workspace_id", "idempotency_key"),)
 
 
@@ -196,6 +202,9 @@ class Credential(Base):
     provider_token: Mapped[str | None] = mapped_column(String(4096))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    next_reconcile_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class DevicePairing(Base):
@@ -338,5 +347,87 @@ class VoiceChunk(Base):
         ForeignKeyConstraint(
             ["workspace_id", "repository_id", "session_id"],
             ["voice_sessions.workspace_id", "voice_sessions.repository_id", "voice_sessions.id"],
+        ),
+    )
+
+
+class TeachingRun(Base):
+    __tablename__ = "teaching_runs"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    operation_id: Mapped[str] = mapped_column(String(128))
+    request_digest: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32))
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC) + timedelta(days=1)
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id", "author_id", "operation_id", name="teaching_run_operation"
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class ModelOperation(Base):
+    __tablename__ = "model_operations"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    request_digest: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32))
+    result: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class Artifact(Base):
+    __tablename__ = "artifacts"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    object_key: Mapped[str] = mapped_column(String(512))
+    sha256: Mapped[str] = mapped_column(String(64))
+    content_type: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    bytes: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class PublicationIndex(Base):
+    __tablename__ = "publication_index"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    statement: Mapped[str] = mapped_column(String(8000))
+    source_commit: Mapped[str] = mapped_column(String(40))
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "revision_id"],
+            [
+                "decision_revisions.workspace_id",
+                "decision_revisions.repository_id",
+                "decision_revisions.id",
+            ],
         ),
     )

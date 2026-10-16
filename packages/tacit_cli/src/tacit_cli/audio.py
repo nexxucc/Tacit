@@ -203,3 +203,25 @@ def capture_chunks(
                 stream.close()
             except Exception:
                 pass
+
+
+def play(audio: bytes) -> None:
+    """Explicit PCM WAV playback after capture has stopped."""
+    import io
+    import wave
+
+    try:
+        sd = backend()
+
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            if wav.getsampwidth() != 2 or wav.getcomptype() != "NONE":
+                raise AudioError("Playback requires PCM16 WAV")
+            with sd.RawOutputStream(
+                samplerate=wav.getframerate(), channels=wav.getnchannels(), dtype="int16"
+            ) as output:
+                while data := wav.readframes(4096):
+                    output.write(data)
+    except (ImportError, OSError, wave.Error) as exc:
+        raise AudioError(
+            "Audio playback unavailable; install the audio extra and PortAudio"
+        ) from exc

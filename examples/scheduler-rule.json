@@ -1,0 +1,13 @@
+{
+  "domain": "scheduler-v1",
+  "action": "publish_result",
+  "condition": {
+    "op": "any",
+    "children": [
+      {"op": "eq", "field": "lease_expired", "value": true},
+      {"op": "eq", "field": "cancelled", "value": true},
+      {"op": "eq", "field": "owns_attempt", "value": false}
+    ]
+  },
+  "outcome": "forbidden"
+}

@@ -210,3 +210,40 @@ class GitHub:
             raise DomainError(
                 "source_unbound", "GitHub source binding could not be verified", 409
             ) from None
+
+    def source_text(
+        self, token: str, full_name: str, commit: str, files: tuple[str, ...]
+    ) -> dict[str, dict[str, Any]]:
+        """Pinned UTF-8 regular files, bounded before entering a model context."""
+        import base64
+
+        bindings = self.source_bindings(token, full_name, commit, files)
+        result = {}
+        total = 0
+        for binding in bindings:
+            response = self.request(
+                "GET",
+                f"/repos/{quote(full_name, safe='/')}/contents/{quote(binding.path, safe='/')}?ref={commit}",
+                token=token,
+            )
+            try:
+                body = response.json()
+                if (
+                    body.get("sha") != binding.blob_sha
+                    or body.get("encoding") != "base64"
+                    or body.get("size", 999999) > 65536
+                ):
+                    raise ValueError
+                raw = base64.b64decode(body["content"].replace("\n", ""), validate=True)
+                total += len(raw)
+                if len(raw) > 65536 or total > 131072:
+                    raise ValueError
+                result[binding.path] = {
+                    "blob_sha": binding.blob_sha,
+                    "lines": raw.decode("utf-8").splitlines(),
+                }
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise DomainError(
+                    "source_unbound", "Source is not a bounded UTF-8 file at this commit", 422
+                ) from None
+        return result

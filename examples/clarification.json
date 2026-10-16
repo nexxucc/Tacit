@@ -1,0 +1,8 @@
+{
+  "operation_id": "replace-with-new-operation-id",
+  "expected_version": 1,
+  "candidate_id": "replace-with-returned-candidate-id",
+  "answers": {},
+  "accept_assumptions": false,
+  "replace_rule": false
+}

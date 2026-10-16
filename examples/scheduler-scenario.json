@@ -1,0 +1,11 @@
+{
+  "action": "publish_result",
+  "facts": {
+    "worker": "worker-1",
+    "lease_expired": true,
+    "cancelled": false,
+    "completed": true,
+    "owns_attempt": true,
+    "attempt": 0
+  }
+}

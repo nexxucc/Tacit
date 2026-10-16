@@ -69,6 +69,21 @@ class TacitClient:
         except httpx.HTTPError:
             raise ClientError("Cannot reach the Tacit API") from None
 
+    def audio(self, path: str) -> bytes:
+        try:
+            with self.http.stream("GET", path) as response:
+                response.raise_for_status()
+                data = bytearray()
+                for chunk in response.iter_bytes():
+                    data.extend(chunk)
+                    if len(data) > 28640044:
+                        raise ClientError("Audio artifact exceeds the client budget")
+                return bytes(data)
+        except httpx.HTTPError:
+            raise ClientError(
+                "Audio artifact unavailable; check permission, retention and connectivity"
+            ) from None
+
     @contextmanager
     def voice_socket(self, path: str) -> Iterator[Any]:
         url = str(self.http.base_url).rstrip("/")

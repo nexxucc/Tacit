@@ -1,3 +1,4 @@
+from typing import Literal
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
@@ -21,7 +22,9 @@ def create_server() -> FastMCP:
 
     def request(method: str, path: str, body: object = None) -> object:
         with TacitClient(agent=True) as client:
-            return client.request(method, path, **({"json": body} if body is not None else {}))
+            return client.request(
+                method, path, **({"json": body} if body is not None else {}), timeout=150
+            )
 
     def escape(value: str) -> str:
         return quote(value, safe="")
@@ -63,11 +66,20 @@ def create_server() -> FastMCP:
 
     @server.tool(annotations=read_only)
     def ask_repository(
-        repository_id: str, snapshot_id: str, source_commit: str, question: str
+        repository_id: str,
+        snapshot_id: str,
+        source_commit: str,
+        question: str,
+        reason: bool = False,
+        operation_id: str | None = None,
     ) -> ContextResponse:
-        """Read scoped confirmed statements; scaffold has no question reasoner."""
+        """Read confirmed statements; opt-in text reasoning requires an operation ID and may consume resources."""
         body = QuestionRequest(
-            snapshot_id=snapshot_id, source_commit=source_commit, question=question
+            snapshot_id=snapshot_id,
+            source_commit=source_commit,
+            question=question,
+            reason=reason,
+            operation_id=operation_id,
         )
         return ContextResponse.model_validate(
             request(
@@ -77,10 +89,16 @@ def create_server() -> FastMCP:
 
     @server.tool(annotations=read_only)
     def evaluate_scenario(
-        repository_id: str, snapshot_id: str, source_commit: str, facts: dict[str, Scalar]
+        repository_id: str,
+        snapshot_id: str,
+        source_commit: str,
+        facts: dict[str, Scalar],
+        action: Literal["compute", "upload", "publish_result", "retry"] | None = None,
     ) -> EvaluationResponse:
         """Evaluate typed equality predicates. Missing facts produce unknown, never implicit permission."""
-        body = ScenarioRequest(snapshot_id=snapshot_id, source_commit=source_commit, facts=facts)
+        body = ScenarioRequest(
+            snapshot_id=snapshot_id, source_commit=source_commit, facts=facts, action=action
+        )
         return EvaluationResponse.model_validate(
             request(
                 "POST", f"/v1/repos/{escape(repository_id)}/evaluate", body.model_dump(mode="json")

@@ -398,7 +398,13 @@ def test_persisted_snapshot_retrieval_and_tenant_isolation(setup):
     result = client.post("/v1/repos/gh-101/context", headers=owner, json=body)
     assert result.status_code == 200, result.text
     assert result.json()["decisions"][0]["statement"] == decision.statement
-    assert result.json()["usage"] == {"stt_calls": 0, "tts_calls": 0, "reasoning_calls": 0}
+    assert result.json()["usage"] == {
+        "stt_calls": 0,
+        "tts_calls": 0,
+        "reasoning_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
     assert client.post("/v1/repos/gh-202/context", headers=owner, json=body).status_code == 404
     learner = login(client, provider, engine, 2)
     assert client.post("/v1/repos/gh-101/context", headers=learner, json=body).status_code == 404

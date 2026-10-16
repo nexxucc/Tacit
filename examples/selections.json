@@ -1,0 +1,10 @@
+[
+  {
+    "path": "packages/tacit_domain/src/tacit_domain/access.py",
+    "symbol": "authorize",
+    "start_line": 1,
+    "end_line": 80,
+    "captured_at": "2026-10-14T12:00:00+05:30",
+    "dirty_sha256": null
+  }
+]

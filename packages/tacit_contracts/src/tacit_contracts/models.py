@@ -1,7 +1,16 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 
 class Contract(BaseModel):
@@ -29,9 +38,79 @@ class Predicate(Contract):
     equals: Scalar
 
 
+class Expression(Contract):
+    op: Literal["eq", "ne", "lt", "le", "gt", "ge", "all", "any", "not"]
+    field: str | None = Field(default=None, min_length=1, max_length=100)
+    value: Scalar | None = None
+    children: tuple["Expression", ...] = Field(default=(), max_length=16)
+
+    @model_validator(mode="after")
+    def shape(self) -> "Expression":
+        def size(node: "Expression", depth: int = 0) -> int:
+            if depth > 6:
+                raise ValueError("Expression depth exceeds six")
+            return 1 + sum(size(c, depth + 1) for c in node.children)
+
+        if size(self) > 64:
+            raise ValueError("Expression exceeds 64 nodes")
+        if self.op in {"all", "any", "not"}:
+            if (
+                self.field is not None
+                or self.value is not None
+                or not self.children
+                or (self.op == "not" and len(self.children) != 1)
+            ):
+                raise ValueError("Invalid boolean expression")
+        elif self.field is None or self.value is None or self.children:
+            raise ValueError("Comparison requires field and value")
+        elif self.op in {"lt", "le", "gt", "ge"} and type(self.value) is not int:
+            raise ValueError("Ordered comparisons require integers")
+        return self
+
+
 class Rule(Contract):
-    when: tuple[Predicate, ...] = Field(min_length=1, max_length=16)
+    when: tuple[Predicate, ...] = Field(default=(), max_length=16)
+    condition: Expression | None = None
+    action: Literal["compute", "upload", "publish_result", "retry"] | None = None
+    domain: Literal["scheduler-v1"] | None = None
     outcome: Literal["permitted", "forbidden"]
+
+    @model_validator(mode="after")
+    def one_condition(self) -> "Rule":
+        if bool(self.when) == (self.condition is not None):
+            raise ValueError("Provide equality predicates or one condition expression")
+        if self.domain is not None:
+            allowed = {
+                "worker": (str, ("worker-1", "worker-2")),
+                "attempt": (int, (0, 1)),
+                **{
+                    k: (bool, (False, True))
+                    for k in ("lease_expired", "cancelled", "completed", "owns_attempt")
+                },
+            }
+
+            def check(field: str, value: Scalar) -> None:
+                if (
+                    field not in allowed
+                    or type(value) is not allowed[field][0]
+                    or value not in allowed[field][1]
+                ):
+                    raise ValueError("Predicate is outside scheduler-v1")
+
+            for predicate in self.when:
+                check(predicate.field, predicate.equals)
+
+            def walk(node: Expression) -> None:
+                if node.field is not None and node.value is not None:
+                    check(node.field, node.value)
+                for child in node.children:
+                    walk(child)
+
+            if self.condition:
+                walk(self.condition)
+            if self.action is None:
+                raise ValueError("Scheduler rules require an action")
+        return self
 
 
 class Evidence(Contract):
@@ -53,6 +132,7 @@ class Decision(Contract):
     files: tuple[str, ...]
     source_commit: str
     sources: tuple[SourceBinding, ...] = ()
+    grounding: dict[str, object] | None = None
     evidence: tuple[Evidence, ...]
     rule: Rule | None = None
 
@@ -61,6 +141,8 @@ class Usage(Contract):
     stt_calls: int = 0
     tts_calls: int = 0
     reasoning_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class ContextRequest(Contract):
@@ -73,12 +155,21 @@ class ContextRequest(Contract):
 
 class QuestionRequest(ContextRequest):
     question: str = Field(min_length=1, max_length=2000)
+    reason: bool = False
+    operation_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def reason_operation(self) -> "QuestionRequest":
+        if self.reason and self.operation_id is None:
+            raise ValueError("Reasoned questions require an operation ID")
+        return self
 
 
 class ScenarioRequest(Contract):
     snapshot_id: str
     source_commit: str
     facts: dict[str, Scalar] = Field(max_length=32)
+    action: Literal["compute", "upload", "publish_result", "retry"] | None = None
 
 
 class ContextResponse(Contract):
@@ -90,7 +181,7 @@ class ContextResponse(Contract):
     status: Literal["answered", "unknown", "conflict"]
     decisions: tuple[Decision, ...] = ()
     answer: str | None = None
-    answer_kind: Literal["confirmed_statements", "none"] = "none"
+    answer_kind: Literal["confirmed_statements", "cited_reasoning", "none"] = "none"
     evidence: tuple[Evidence, ...] = ()
     warnings: tuple[str, ...] = ()
     truncated: bool = False
@@ -214,6 +305,7 @@ class DraftView(Contract):
     rule: Rule | None = None
     previous: Decision | None = None
     voice: VoiceEvidence | None = None
+    grounding: dict[str, object] | None = None
     review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: Literal["ready_for_review", "published"] = "ready_for_review"
     published_snapshot_id: str | None = None
@@ -277,3 +369,117 @@ class VoiceSessionView(Contract):
     audio_sha256: str | None = None
     expires_at: str
     draft: DraftView | None = None
+
+
+class Selection(Contract):
+    path: str = Field(min_length=1, max_length=512)
+    symbol: str | None = Field(default=None, max_length=200)
+    start_line: int = Field(default=1, ge=1, le=100000)
+    end_line: int = Field(default=200, ge=1, le=100000)
+    dirty_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    captured_at: str = Field(max_length=64)
+
+    @model_validator(mode="after")
+    def bounded(self) -> "Selection":
+        DraftRequest.valid_files((self.path,))
+        if self.end_line < self.start_line or self.end_line - self.start_line >= 400:
+            raise ValueError("Select at most 400 source lines")
+        from datetime import datetime
+
+        if datetime.fromisoformat(self.captured_at).tzinfo is None:
+            raise ValueError("Context timestamp must include timezone")
+        return self
+
+
+class GroundingCitation(Contract):
+    path: str
+    blob_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+
+class Candidate(Contract):
+    id: str = Field(min_length=1, max_length=64)
+    statement: str = Field(min_length=1, max_length=8000)
+    transcript_quote: str = Field(min_length=1, max_length=4000)
+    citations: tuple[GroundingCitation, ...] = Field(min_length=1, max_length=20)
+    rule: Rule | None = None
+    assumptions: tuple[str, ...] = Field(default=(), max_length=12)
+    questions: tuple[str, ...] = Field(default=(), max_length=12)
+
+
+class CandidateSet(Contract):
+    candidates: tuple[Candidate, ...] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def unique(self) -> "CandidateSet":
+        if len({c.id for c in self.candidates}) != len(self.candidates):
+            raise ValueError("Candidate IDs must be unique")
+        return self
+
+
+class TeachingRequest(Contract):
+    operation_id: str = Field(min_length=1, max_length=128)
+    source_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    files: tuple[str, ...] = Field(min_length=1, max_length=20)
+    expected_snapshot_id: str | None
+    transcript_operation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    statement: str | None = Field(default=None, min_length=1, max_length=120000)
+    selections: tuple[Selection, ...] = Field(default=(), max_length=20)
+
+    @model_validator(mode="after")
+    def input_binding(self) -> "TeachingRequest":
+        DraftRequest.valid_files(self.files)
+        if (self.statement is None) == (self.transcript_operation_id is None):
+            raise ValueError("Choose text or original transcript input")
+        if any(selection.path not in self.files for selection in self.selections):
+            raise ValueError("Selections must belong to the bound files")
+        return self
+
+
+class ClarificationAnswer(Contract):
+    operation_id: str = Field(min_length=1, max_length=128)
+    expected_version: int = Field(ge=1)
+    candidate_id: str = Field(min_length=1, max_length=64)
+    answers: dict[str, str] = Field(default_factory=dict, max_length=32)
+    statement: str | None = Field(default=None, min_length=1, max_length=8000)
+    rule: Rule | None = None
+    replace_rule: bool = False
+    accept_assumptions: bool = False
+
+
+class TeachingView(Contract):
+    id: str
+    repository_id: str
+    author_id: str
+    version: int
+    status: Literal[
+        "processing", "uncertain", "needs_clarification", "ready_for_review", "drafted", "cancelled"
+    ]
+    candidates: tuple[Candidate, ...] = ()
+    baseline: tuple[Decision, ...] = ()
+    selected_candidate_id: str | None = None
+    scenarios: tuple[dict[str, object], ...] = ()
+    questions: dict[str, str] = Field(default_factory=dict)
+    answers: dict[str, str] = Field(default_factory=dict)
+    source: TeachingRequest
+    usage: Usage = Field(default_factory=Usage)
+    draft: DraftView | None = None
+
+
+class PrepareDraft(Contract):
+    operation_id: str = Field(min_length=1, max_length=128)
+    expected_version: int = Field(ge=1)
+    decision_id: str | None = Field(default=None, max_length=64)
+
+
+class CitedAnswer(Contract):
+    answer: str = Field(min_length=1, max_length=8000)
+    revision_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+
+
+class SpeakRequest(Contract):
+    operation_id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=2000)
+    voice: str = Field(min_length=1, max_length=100)
+    language: str = Field(default="en-IN", max_length=32)

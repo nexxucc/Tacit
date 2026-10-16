@@ -75,7 +75,22 @@ class KnowledgeService:
             if d.source_commit == request.source_commit
             and (not request.files or set(d.files).intersection(request.files))
         )
-        page = items[request.cursor : request.cursor + request.limit]
+        selected = items[request.cursor : request.cursor + request.limit]
+        collected: list[Decision] = []
+        characters = 0
+        for decision in selected:
+            size = len(decision.model_dump_json())
+            if characters + size > 64000:
+                if not collected:
+                    raise DomainError(
+                        "context_budget",
+                        "A decision exceeds the context budget; use its scoped history endpoint",
+                        413,
+                    )
+                break
+            collected.append(decision)
+            characters += size
+        page = tuple(collected)
         more = request.cursor + len(page) < len(items)
         return ContextResponse(
             workspace_id=repo.workspace_id,
@@ -100,9 +115,14 @@ class KnowledgeService:
             if request.source_commit == snap.source_commit
             else (),
             request.facts,
+            request.action,
         )
         return EvaluationResponse(
-            repository_id=rid, snapshot_id=snap.id, decision=result, rule_references=references
+            repository_id=rid,
+            snapshot_id=snap.id,
+            decision=result,
+            rule_references=references,
+            evaluator_version="typed-expression-v2",
         )
 
     def history(

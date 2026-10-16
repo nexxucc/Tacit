@@ -173,6 +173,7 @@ class PublicationService:
         body: DraftRequest,
         *,
         voice: VoiceEvidence | None = None,
+        grounding: dict[str, object] | None = None,
     ) -> DraftView:
         if body.transcript_draft_id and body.transcript_operation_id:
             raise DomainError("invalid_correction", "Select one original transcript reference", 422)
@@ -238,6 +239,8 @@ class PublicationService:
                     mode="json", exclude={"transcript_draft_id", "transcript_operation_id"}
                 )
             )
+        if grounding is not None:
+            request_digest = fingerprint({"request_digest": request_digest, "grounding": grounding})
         # Authorize before reading drafts or making any provider call.
         with Session(self.engine) as db, db.begin():
             repo = self.write_repository(db, p, rid, token)
@@ -336,6 +339,7 @@ class PublicationService:
                 rule=body.rule,
                 previous=previous,
                 voice=voice,
+                grounding=grounding,
                 review_digest="0" * 64,
             )
             payload = view.model_dump(
@@ -425,6 +429,7 @@ class PublicationService:
                     ),
                 ),
                 rule=view.rule,
+                grounding=view.grounding,
             )
             members = (
                 list(

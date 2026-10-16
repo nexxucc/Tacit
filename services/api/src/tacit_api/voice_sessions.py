@@ -318,7 +318,15 @@ class VoiceSessions:
         with Session(self.manager.engine) as db, db.begin():
             expired = list(
                 db.scalars(
-                    select(VoiceSession).where(VoiceSession.expires_at <= now()).with_for_update()
+                    select(VoiceSession)
+                    .where(
+                        VoiceSession.expires_at <= now(),
+                        VoiceSession.status.not_in(
+                            ("expired", "completed", "needs_correction", "cancelled")
+                        ),
+                    )
+                    .with_for_update(skip_locked=True)
+                    .limit(100)
                 )
             )
             for item in expired:

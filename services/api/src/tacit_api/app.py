@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketDiscon
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -17,6 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import Response
 from tacit_contracts.models import (
     AgentTokenRequest,
+    ClarificationAnswer,
     ContextRequest,
     ContextResponse,
     DevicePoll,
@@ -25,11 +26,15 @@ from tacit_contracts.models import (
     ErrorResponse,
     EvaluationResponse,
     InvitationRequest,
+    PrepareDraft,
     PublicationRequest,
     PublicationResponse,
     QuestionRequest,
     RoleChange,
     ScenarioRequest,
+    SpeakRequest,
+    TeachingRequest,
+    TeachingView,
     VoiceFinishRequest,
     VoiceRequest,
     VoiceSessionRequest,
@@ -39,6 +44,8 @@ from tacit_domain.access import DomainError, Principal
 from tacit_domain.knowledge import KnowledgeService
 
 from tacit_api.access import AccessService
+from tacit_api.answers import Answers
+from tacit_api.artifacts import Artifacts, Objects
 from tacit_api.db import (
     Credential,
     Installation,
@@ -51,11 +58,15 @@ from tacit_api.db import (
     VoiceSession,
     VoiceTranscript,
 )
-from tacit_api.demo import DemoStore, demo_principals
+from tacit_api.demo import DemoStore, demo_principals, multi_user_principals
 from tacit_api.github import GitHub, verify_webhook
+from tacit_api.limits import BodyLimit
 from tacit_api.persistence import PostgreSQLStore
 from tacit_api.providers import SpeechToText
 from tacit_api.publication import PublicationService
+from tacit_api.reasoning import Evon
+from tacit_api.teaching import TeachingService
+from tacit_api.timbre import Timbre
 from tacit_api.voice import MAX_REQUEST_BYTES, Prisma, VoiceService
 from tacit_api.voice_sessions import CHUNK_BYTES, VoiceSessions
 from tacit_api.webhooks import ingest
@@ -73,6 +84,15 @@ class Settings(BaseSettings):
     credential_encryption_key: str = ""
     gnani_api_key: str = ""
     voice_retention_seconds: int = 86400
+    evon_url: str = ""
+    evon_api_key: str = ""
+    evon_model: str = "evon"
+    model_max_input_chars: int = 48000
+    artifact_directory: str = "~/.local/state/tacit/artifacts"
+    artifact_bucket: str = ""
+    artifact_endpoint: str = ""
+    github_install_url: str = ""
+    access_read_cache_seconds: int = Field(default=0, ge=0, le=60)
 
 
 def create_app(
@@ -103,6 +123,7 @@ def create_app(
             engine,
             github or GitHub(settings.github_client_id, settings.github_app_id),
             settings.credential_encryption_key,
+            settings.access_read_cache_seconds,
         )
 
     @asynccontextmanager
@@ -118,9 +139,24 @@ def create_app(
                                 settings.voice_retention_seconds,
                             ).prune
                         )
-                    except SQLAlchemyError:
-                        # Readiness reports missing migrations; cleanup retries after recovery.
-                        pass
+                        await run_in_threadpool(
+                            Artifacts(
+                                PublicationService(access),
+                                Objects(
+                                    settings.artifact_directory,
+                                    settings.artifact_bucket,
+                                    settings.artifact_endpoint,
+                                ),
+                                settings.voice_retention_seconds,
+                            ).prune
+                        )
+                    except Exception:
+                        # Retry on the next cycle; never log object keys, credentials or payloads.
+                        import logging
+
+                        logging.getLogger("tacit.retention").warning(
+                            "Retention cleanup deferred after storage/database failure"
+                        )
                 await asyncio.sleep(60)
 
         cleanup_task = asyncio.create_task(cleanup()) if access is not None else None
@@ -137,6 +173,7 @@ def create_app(
             engine.dispose()
 
     app = FastAPI(title="Tacit API", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(BodyLimit)
     # No production store/auth fallback. Only explicit demo mode creates fixture data.
     service = (
         KnowledgeService(DemoStore())
@@ -147,7 +184,7 @@ def create_app(
             else None
         )
     )
-    tokens = demo_principals() if settings.demo else {}
+    tokens = {**demo_principals(), **multi_user_principals()} if settings.demo else {}
     bearer = HTTPBearer(auto_error=False)
 
     @app.middleware("http")
@@ -155,7 +192,9 @@ def create_app(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         request.state.request_id = str(uuid4())
+        started = time.monotonic()
         response = await call_next(request)
+        response.headers["X-Elapsed-Ms"] = str(round((time.monotonic() - started) * 1000, 2))
         response.headers["X-Request-ID"] = request.state.request_id
         return response
 
@@ -187,7 +226,10 @@ def create_app(
         ):
             raise DomainError("forbidden", "Demo mode is loopback-only")
         if credentials is not None and access is not None:
-            return access.principal(credentials.credentials)
+            read = request.method == "GET" or request.url.path.endswith(
+                ("/context", "/questions", "/evaluate")
+            )
+            return access.principal(credentials.credentials, fresh=not read)
         if credentials is None or credentials.credentials not in tokens:
             raise DomainError("unauthenticated", "A valid Tacit credential is required", 401)
         return tokens[credentials.credentials]
@@ -230,6 +272,10 @@ def create_app(
                 db.execute(select(VoiceTranscript.operation_id).limit(1))
                 db.execute(select(VoiceSession.id).limit(1))
                 db.execute(select(VoiceChunk.sequence).limit(1))
+                from tacit_api.db import Artifact, ModelOperation, PublicationIndex, TeachingRun
+
+                for model in (TeachingRun, ModelOperation, Artifact, PublicationIndex):
+                    db.execute(select(model).limit(1))
                 db.execute(select(PublicationReceipt.operation_id).limit(1))
         return {"status": "ready", "persistence": "postgresql"}
 
@@ -263,9 +309,13 @@ def create_app(
         return knowledge().context(p, rid, body)
 
     @app.post("/v1/repos/{rid}/questions", response_model=ContextResponse)
-    def question(
-        rid: str, body: QuestionRequest, p: Principal = Depends(principal)
+    async def question(
+        rid: str, body: QuestionRequest, request: Request, p: Principal = Depends(principal)
     ) -> ContextResponse:
+        if body.reason:
+            return await Answers(publications(), knowledge(), reasoner()).answer(
+                p, rid, request_token(request), body
+            )
         result = knowledge().context(p, rid, body)
         # Exact statements only; no semantic-answer quality claim without a reasoner.
         return result.model_copy(
@@ -338,6 +388,110 @@ def create_app(
         if body is None:
             raise DomainError("unsupported_schema", "A source-bound text draft is required", 422)
         return manager.create(p, rid, request.headers["Authorization"].split(" ", 1)[1], body)
+
+    def reasoner() -> Evon:
+        return Evon(
+            settings.evon_url,
+            settings.evon_api_key,
+            settings.evon_model,
+            settings.model_max_input_chars,
+        )
+
+    def teaching() -> TeachingService:
+        return TeachingService(publications(), reasoner())
+
+    def artifacts() -> Artifacts:
+        return Artifacts(
+            publications(),
+            Objects(
+                settings.artifact_directory, settings.artifact_bucket, settings.artifact_endpoint
+            ),
+            settings.voice_retention_seconds,
+        )
+
+    @app.get("/v1/install")
+    def install_info(p: Principal = Depends(principal)) -> dict[str, str]:
+        if not settings.github_install_url:
+            raise DomainError(
+                "service_unavailable", "Backend installation URL is not configured", 503
+            )
+        if not settings.github_install_url.startswith(
+            "https://github.com/apps/"
+        ) or not settings.github_install_url.endswith("/installations/new"):
+            raise DomainError("service_unavailable", "Configure a GitHub App installation URL", 503)
+        return {"url": settings.github_install_url}
+
+    @app.post("/v1/repos/{rid}/teaching-runs", response_model=TeachingView)
+    async def extract(
+        rid: str, body: TeachingRequest, request: Request, p: Principal = Depends(maintainer)
+    ) -> TeachingView:
+        return await teaching().start(p, rid, request_token(request), body)
+
+    @app.get("/v1/repos/{rid}/teaching-runs")
+    def teaching_runs(
+        rid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> tuple[TeachingView, ...]:
+        return teaching().list(p, rid, request_token(request))
+
+    @app.get("/v1/repos/{rid}/teaching-runs/{sid}", response_model=TeachingView)
+    def teaching_run(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> TeachingView:
+        return teaching().get(p, rid, request_token(request), sid)
+
+    @app.post("/v1/repos/{rid}/teaching-runs/{sid}/answers", response_model=TeachingView)
+    def clarification(
+        rid: str,
+        sid: str,
+        body: ClarificationAnswer,
+        request: Request,
+        p: Principal = Depends(maintainer),
+    ) -> TeachingView:
+        return teaching().answer(p, rid, request_token(request), sid, body)
+
+    @app.post("/v1/repos/{rid}/teaching-runs/{sid}/draft", response_model=TeachingView)
+    def grounded_draft(
+        rid: str, sid: str, body: PrepareDraft, request: Request, p: Principal = Depends(maintainer)
+    ) -> TeachingView:
+        return teaching().prepare(p, rid, request_token(request), sid, body)
+
+    @app.delete("/v1/repos/{rid}/teaching-runs/{sid}", response_model=TeachingView)
+    def cancel_teaching(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> TeachingView:
+        return teaching().cancel(p, rid, request_token(request), sid)
+
+    @app.post("/v1/repos/{rid}/clarification-audio")
+    async def speak(
+        rid: str, body: SpeakRequest, request: Request, p: Principal = Depends(maintainer)
+    ) -> dict[str, object]:
+        return await Timbre(settings.gnani_api_key, artifacts()).speak(
+            p, rid, request_token(request), body
+        )
+
+    @app.get("/v1/repos/{rid}/artifacts/{aid}")
+    def artifact_audio(
+        rid: str, aid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> Response:
+        return Response(
+            artifacts().read(p, rid, request_token(request), aid),
+            media_type="audio/wav",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.delete("/v1/repos/{rid}/artifacts/{aid}")
+    def delete_artifact(
+        rid: str, aid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> dict[str, str]:
+        artifacts().delete(p, rid, request_token(request), aid)
+        return {"status": "deleted"}
+
+    @app.post("/v1/repos/{rid}/voice-sessions/{sid}/archive")
+    def archive_audio(
+        rid: str, sid: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> dict[str, object]:
+        audio = voice_sessions().audio(p, rid, request_token(request), sid)
+        return artifacts().create(p, rid, request_token(request), audio)
 
     def voice_sessions() -> VoiceSessions:
         return VoiceSessions(

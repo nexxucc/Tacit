@@ -2,13 +2,14 @@
 name = "tacit-cli"
 version = "0.1.0"
 requires-python = ">=3.12,<3.15"
-dependencies = ['tacit-client', 'typer>=0.15,<1', 'rich>=13,<15']
+dependencies = ['tacit-client', 'typer>=0.15,<1', 'rich>=13,<15', 'textual>=0.89,<9']
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.5,<1"]
 
 [project.scripts]
 tacit = "tacit_cli.main:main"
+tacit-intent = "tacit_cli.main:main"
 
 [build-system]
 requires = ["hatchling"]

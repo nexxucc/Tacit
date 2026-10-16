@@ -69,3 +69,50 @@ def test_client_handles_malformed_responses_without_reflecting_payload(
         with pytest.raises(ClientError) as error:
             client.request("GET", "/v1/auth/me")
         assert "secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("reason", [False, True])
+@pytest.mark.parametrize("agent", [False, True])
+def test_ask_timeout_covers_reasoning_and_preserves_operation_id(monkeypatch, reason, agent):
+    import tacit_cli.main as cli
+
+    monkeypatch.setenv("TACIT_TOKEN", "fixture-human")
+    monkeypatch.setenv("TACIT_AGENT_TOKEN", "fixture-agent")
+    monkeypatch.setenv("TACIT_API_URL", "http://127.0.0.1:8000")
+    observed = []
+
+    def respond(request):
+        if request.url.path == "/v1/auth/me":
+            return httpx.Response(200, json={"agent": True})
+        body = json.loads(request.content)
+        timeout = request.extensions["timeout"]["read"]
+        observed.append((body, timeout))
+        # Simulate a response taking 20 seconds without a slow wall-clock test.
+        if body["reason"] and timeout < 20:
+            raise httpx.ReadTimeout("Simulated model latency", request=request)
+        return httpx.Response(200, json={"answer": "Fixture answer"})
+
+    monkeypatch.setattr(
+        cli,
+        "TacitClient",
+        lambda **kwargs: TacitClient(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    args = [
+        "ask",
+        "May workers publish?",
+        "--repo",
+        "gh-101",
+        "--snapshot",
+        "fixture",
+        "--commit",
+        "a" * 40,
+    ]
+    if agent:
+        args += ["--agent"]
+    if reason:
+        args += ["--reason", "--operation-id", "stable-question-operation"]
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["answer"] == "Fixture answer"
+    assert observed[0][1] == (150 if reason else 15)
+    assert observed[0][0]["operation_id"] == ("stable-question-operation" if reason else None)

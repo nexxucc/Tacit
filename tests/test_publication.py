@@ -111,7 +111,13 @@ def test_draft_private_confirmation_retrieval_and_retries(setup):
     ).json()
     assert context["decisions"][0]["statement"] == view["statement"]
     assert context["evidence"][0]["kind"] == "text"
-    assert context["usage"] == {"stt_calls": 0, "tts_calls": 0, "reasoning_calls": 0}
+    assert context["usage"] == {
+        "stt_calls": 0,
+        "tts_calls": 0,
+        "reasoning_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
     changed = publish(client, owner, view, operation=publication_op, review_digest="0" * 64)
     assert changed.status_code == 409 and changed.json()["code"] == "idempotency_conflict"
 
@@ -395,7 +401,13 @@ def test_cli_review_cancel_confirm_and_mcp_read_same_snapshot(setup, monkeypatch
         )
     )
     assert content[1]["decisions"][0]["statement"] == view["statement"]
-    assert content[1]["usage"] == {"stt_calls": 0, "tts_calls": 0, "reasoning_calls": 0}
+    assert content[1]["usage"] == {
+        "stt_calls": 0,
+        "tts_calls": 0,
+        "reasoning_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
     assert len(writes) == 1
 
 

@@ -1,9 +1,15 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Tacit — project intent for developers</title>
-<style>body{max-width:760px;margin:4rem auto;padding:0 1rem;font:18px/1.6 system-ui;background:#10151b;color:#e5edf5}code,pre{background:#1e2935;padding:.4rem}a{color:#8fcfff}</style>
-<main><h1>Tacit</h1><p>Capture the reasoning behind your code. Give developers and agents confirmed, versioned project intent.</p>
-<h2>Development preview</h2><p>Python CLI, read-only MCP and agent skill. GitHub authorization and voice teaching are still under development. No public installer is available.</p>
-<pre>uv sync --frozen
-uv run tacit --help</pre><p>Clone the project first, then run these commands from its root. The command name is provisional.</p>
-<p>See <code>development.md</code> in the checkout for local demo setup.</p></main></html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tacit — confirmed project intent</title>
+<style>body{max-width:900px;margin:4rem auto;padding:0 1.5rem;font:18px/1.65 system-ui;background:#111820;color:#e8eef4}h1{font-size:3rem;line-height:1.1}a{color:#a4d4ff}pre{background:#1d2936;padding:1.2rem;overflow:auto;border-radius:10px}section{margin:3rem 0}.note{border-left:3px solid #eab676;padding-left:1rem}li{margin:.4rem 0}</style></head>
+<body><main><h1>Make project intent explicit.</h1><p>Tacit turns a maintainer's spoken explanation into source-bound proposals. Clarify ambiguity, review evidence, and confirm a versioned snapshot that developers and coding agents can retrieve.</p>
+<p class="note">Development checkout for Arch Linux. The final development additions await testing. No public installer or validated release is available.</p>
+<section><h2>Install from your checkout</h2><p>Install uv and Python, then clone the repository. Arch microphone capture and playback also require PortAudio and the audio extra.</p><pre>cd Tacit
+bash scripts/install-arch.sh --audio</pre><p>The optional launcher is <code>tacit-intent</code>. Existing executables are never replaced. You can continue using <code>uv run tacit</code> inside the checkout.</p></section>
+<section><h2>Teach, clarify, confirm</h2><ol><li>Sign in through the configured GitHub App. Your repository role controls teaching access.</li><li>Capture speech with <code>teach-voice</code> and inspect the original transcript.</li><li>Use <code>teaching extract</code> to propose grounded candidates through your configured Evon endpoint.</li><li>Review alternatives and bounded scheduler scenarios with <code>teaching review --ui</code>.</li><li>Resolve clarification, prepare a draft, and use <code>confirm</code> to publish its exact reviewed digest.</li></ol><p>Model output stays a proposal until a human maintainer confirms it. Learners and delegated agents remain read-only.</p></section>
+<section><h2>Consume confirmed knowledge</h2><pre>uv run tacit context --repo REPO --snapshot SNAPSHOT --commit COMMIT
+uv run tacit-mcp</pre><p>Six local MCP tools return authorized text, evidence and snapshot identity. Exact retrieval uses no speech or reasoning provider. Optional cited text reasoning is explicit.</p></section>
+<section><h2>Run your backend</h2><p>Configure PostgreSQL, GitHub and a stable encryption key. Provider keys stay on the backend. The API and worker are separate processes; migrations are explicit.</p><pre>uv run --env-file .env alembic upgrade head
+uv run --env-file .env tacit-api
+uv run --env-file .env tacit-worker</pre><p>See development.md and final-development.md in the checkout for commands, configuration and limits.</p></section>
+</main></body></html>
