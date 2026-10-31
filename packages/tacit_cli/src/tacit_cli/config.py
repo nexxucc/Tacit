@@ -1,16 +1,17 @@
 """Private, identity/backend-scoped selection defaults; never stores credentials."""
 
 import json
-import os
 from pathlib import Path
 
 from pydantic import TypeAdapter
 from tacit_client.client import ClientError, TacitClient
 from tacit_client.credentials import api_url
 
+from tacit_cli.local_storage import config_path, private_directory, reject_redirected_path
+
 
 def filename() -> Path:
-    return Path(os.environ.get("TACIT_CONFIG", str(Path.home() / ".config/tacit/config.json")))
+    return config_path()
 
 
 def profile() -> tuple[str, str]:
@@ -25,9 +26,11 @@ def read() -> dict[str, object]:
     path = filename()
     if not path.exists():
         return {}
-    if path.is_symlink():
-        raise ClientError("Configuration must not be a symlink")
-    return TypeAdapter(dict[str, object]).validate_json(path.read_text())
+    try:
+        reject_redirected_path(path)
+    except OSError:
+        raise ClientError("Configuration must not use a symlink or reparse point") from None
+    return TypeAdapter(dict[str, object]).validate_json(path.read_text(encoding="utf-8"))
 
 
 def save(workspace: str, repository: str | None = None) -> None:
@@ -36,8 +39,10 @@ def save(workspace: str, repository: str | None = None) -> None:
     key = server + ":" + user
     data[key] = {"workspace": workspace, "repository": repository}
     path = filename()
-    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    path.parent.chmod(0o700)
+    if not path.parent.exists():
+        private_directory(path.parent)
+    # An explicit TACIT_CONFIG can live in an existing shared directory. Keep
+    # new directories private without changing permissions on user-owned ones.
     from tacit_cli.spool import atomic
 
     atomic(path, json.dumps(data).encode())

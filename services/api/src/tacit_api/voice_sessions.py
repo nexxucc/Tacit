@@ -198,22 +198,123 @@ class VoiceSessions:
         with Session(self.manager.engine) as db, db.begin():
             return self.view(self.scoped(db, p, rid, token, sid), db)
 
+    def live_digest(self, item: VoiceSession) -> str:
+        return fingerprint({"transport": "live", "session_id": item.id, "context": item.context})
+
+    def reserve_live(
+        self, p: Principal, rid: str, token: str, sid: str
+    ) -> tuple[VoiceSessionRequest, VoiceSessionView]:
+        """Reserve once before opening a billable live provider connection."""
+        with Session(self.manager.engine) as db, db.begin():
+            item = self.scoped(db, p, rid, token, sid)
+            if item.status != "uploading" or item.chunks or item.pcm_bytes:
+                raise DomainError("voice_state", "Live capture requires a fresh empty session", 409)
+            self.check_operation(db, item.workspace_id, rid, p.user_id, item.operation_id)
+            body = VoiceSessionRequest.model_validate(item.context)
+            repo = db.get(Repository, (item.workspace_id, rid))
+            assert repo is not None
+            self.manager.current(db, repo, body.expected_snapshot_id)
+            db.add(
+                VoiceAttempt(
+                    workspace_id=item.workspace_id,
+                    repository_id=rid,
+                    author_id=p.user_id,
+                    operation_id=item.operation_id,
+                    request_digest=self.live_digest(item),
+                )
+            )
+            item.status = "processing"
+            return body, self.view(item, db)
+
+    def ensure_live(self, db: Session, item: VoiceSession) -> None:
+        attempt = db.get(
+            VoiceAttempt,
+            (item.workspace_id, item.repository_id, item.author_id, item.operation_id),
+        )
+        if (
+            item.status != "processing"
+            or attempt is None
+            or attempt.request_digest != self.live_digest(item)
+        ):
+            raise DomainError("voice_state", "Live attempt is no longer active", 409)
+
+    def finish_live(
+        self, p: Principal, rid: str, token: str, sid: str, body: VoiceFinishRequest
+    ) -> VoiceSessionView:
+        with Session(self.manager.engine) as db, db.begin():
+            item = self.scoped(db, p, rid, token, sid)
+            self.ensure_live(db, item)
+            if item.audio_sha256 is not None:
+                raise DomainError("voice_state", "Live capture was already finalized", 409)
+            pcm = self.pcm(db, item)
+            hashed = hashlib.sha256(pcm).hexdigest()
+            if body.chunks != item.chunks or body.audio_sha256 != hashed:
+                raise DomainError(
+                    "audio_missing", "Live recording manifest does not match audio", 409
+                )
+            item.capture_complete = body.capture_complete
+            item.audio_sha256 = hashed
+            return self.view(item, db)
+
+    def live_pcm(self, p: Principal, rid: str, token: str, sid: str) -> bytes:
+        with Session(self.manager.engine) as db, db.begin():
+            item = self.scoped(db, p, rid, token, sid)
+            self.ensure_live(db, item)
+            pcm = self.pcm(db, item)
+            if not pcm or item.audio_sha256 != hashlib.sha256(pcm).hexdigest():
+                raise DomainError("audio_missing", "Live capture is not finalized", 409)
+            return pcm
+
+    def abandon_live(self, author: str, rid: str, sid: str) -> None:
+        """Private cleanup must still work when the caller's credential was revoked."""
+        with Session(self.manager.engine) as db, db.begin():
+            item = db.scalar(
+                select(VoiceSession)
+                .where(
+                    VoiceSession.repository_id == rid,
+                    VoiceSession.id == sid,
+                    VoiceSession.author_id == author,
+                )
+                .with_for_update()
+            )
+            if item is None or item.status != "processing":
+                return
+            self.ensure_live(db, item)
+            # A disconnected client may have additional local chunks. This hash
+            # describes only the acknowledged retained prefix, never unseen audio.
+            item.audio_sha256 = hashlib.sha256(self.pcm(db, item)).hexdigest()
+            item.status = "uncertain"
+
     def append(
-        self, p: Principal, rid: str, token: str, sid: str, sequence: int, pcm: bytes
+        self,
+        p: Principal,
+        rid: str,
+        token: str,
+        sid: str,
+        sequence: int,
+        pcm: bytes,
+        *,
+        live: bool = False,
     ) -> VoiceSessionView:
         if not 0 <= sequence < 900 or not pcm or len(pcm) > CHUNK_BYTES or len(pcm) % 2:
             raise DomainError("invalid_audio_chunk", "Use bounded, even-length PCM16 chunks", 422)
         hashed = hashlib.sha256(pcm).hexdigest()
         with Session(self.manager.engine) as db, db.begin():
             item = self.scoped(db, p, rid, token, sid)
+            if live:
+                self.ensure_live(db, item)
+                if item.audio_sha256 is not None:
+                    raise DomainError("voice_state", "Live capture was already finalized", 409)
             prior = db.get(VoiceChunk, (item.workspace_id, rid, sid, sequence))
             if prior:
+                if live:
+                    raise DomainError("chunk_sequence", "Live audio cannot be replayed", 409)
                 if prior.sha256 != hashed:
                     raise DomainError(
                         "chunk_conflict", "Sequence was used with different audio", 409
                     )
                 return self.view(item, db)
-            if item.status != "uploading" or sequence != item.chunks:
+            if item.status != ("processing" if live else "uploading") or sequence != item.chunks:
                 raise DomainError(
                     "chunk_sequence", "Upload must resume at the acknowledged sequence", 409
                 )
@@ -413,12 +514,20 @@ class VoiceSessions:
         segments: tuple[dict[str, str | int], ...],
         pcm: bytes,
         transcription_complete: bool = True,
+        *,
+        reserved_live: bool = False,
     ) -> dict[str, object]:
         with Session(self.manager.engine) as db, db.begin():
             item = self.scoped(db, p, rid, token, sid)
             if item.status != "processing":
                 raise DomainError("voice_state", "Transcription was cancelled", 409)
+            if reserved_live:
+                self.ensure_live(db, item)
+                if item.context != body.model_dump(mode="json"):
+                    raise DomainError("idempotency_conflict", "Live source context changed", 409)
             hashed = hashlib.sha256(pcm).hexdigest()
+            if reserved_live and item.audio_sha256 != hashed:
+                raise DomainError("audio_missing", "Live transcript audio binding changed", 409)
             voice = VoiceEvidence(
                 original_transcript=text,
                 audio_sha256=hashed,
@@ -438,15 +547,16 @@ class VoiceSessions:
                 },
                 "voice": voice.model_dump(mode="json"),
             }
-            db.add(
-                VoiceAttempt(
-                    workspace_id=item.workspace_id,
-                    repository_id=rid,
-                    author_id=p.user_id,
-                    operation_id=body.operation_id,
-                    request_digest=fingerprint(body.model_dump(mode="json")),
+            if not reserved_live:
+                db.add(
+                    VoiceAttempt(
+                        workspace_id=item.workspace_id,
+                        repository_id=rid,
+                        author_id=p.user_id,
+                        operation_id=body.operation_id,
+                        request_digest=fingerprint(body.model_dump(mode="json")),
+                    )
                 )
-            )
             db.flush()
             db.add(
                 VoiceTranscript(

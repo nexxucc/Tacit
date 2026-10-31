@@ -1,0 +1,20 @@
+{
+	email {$TACIT_ACME_EMAIL}
+	admin off
+}
+
+{$TACIT_PUBLIC_HOST} {
+	encode zstd gzip
+	header -Server
+	@api path /v1/* /health/live /health/ready
+	handle @api {
+		# Caddy upgrades WebSockets automatically and preserves the request
+		# body/signature headers used by GitHub's signed webhook endpoint.
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

@@ -1,9 +1,15 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
 import httpx
-from websockets.exceptions import WebSocketException
+from tacit_contracts.versions import (
+    EVALUATOR_VERSION,
+    PROTOCOL_VERSIONS,
+    compatibility_message,
+    protocol_headers,
+)
+from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect
 
 from tacit_client.credentials import CredentialError, api_url, load_token
@@ -11,6 +17,38 @@ from tacit_client.credentials import CredentialError, api_url, load_token
 
 class ClientError(RuntimeError):
     pass
+
+
+class CompatibilityError(ClientError):
+    """A declared wire version cannot be consumed safely by this client."""
+
+
+def validate_response_versions(
+    headers: Mapping[str, str], *, status_code: int | None = None
+) -> None:
+    """Accept legacy versionless servers; fail closed on declared incompatibility."""
+    if status_code == 426:
+        raise CompatibilityError(compatibility_message())
+    declared = []
+    incompatible = []
+    for dimension, header, version in PROTOCOL_VERSIONS:
+        try:
+            value = headers.get(header)
+        except LookupError:
+            # WebSocket headers reject duplicate fields rather than joining them.
+            raise CompatibilityError(compatibility_message((dimension,))) from None
+        if value is not None:
+            declared.append(dimension)
+            if value != version:
+                incompatible.append(dimension)
+    if incompatible:
+        raise CompatibilityError(compatibility_message(incompatible))
+    if declared and len(declared) != len(PROTOCOL_VERSIONS):
+        raise CompatibilityError(
+            "The Tacit backend declared an incomplete compatibility header set. "
+            "Upgrade the client/backend together and preserve all X-Tacit version headers "
+            "through the proxy; the request was not automatically retried."
+        )
 
 
 class TacitClient:
@@ -26,7 +64,7 @@ class TacitClient:
             raise ClientError(str(exc)) from None
         self.http = httpx.Client(
             base_url=url.rstrip("/"),
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}", **protocol_headers()},
             timeout=15,
             transport=transport,
             follow_redirects=False,
@@ -45,8 +83,16 @@ class TacitClient:
         # Callers construct paths, never accept arbitrary URLs from retrieved text.
         try:
             response = self.http.request(method, path, **kwargs)  # type: ignore[arg-type]
+            validate_response_versions(response.headers, status_code=response.status_code)
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            if (
+                isinstance(payload, dict)
+                and "evaluator_version" in payload
+                and payload["evaluator_version"] != EVALUATOR_VERSION
+            ):
+                raise CompatibilityError(compatibility_message(("evaluator",)))
+            return payload
         except httpx.HTTPStatusError as exc:
             try:
                 payload = exc.response.json()
@@ -72,6 +118,7 @@ class TacitClient:
     def audio(self, path: str) -> bytes:
         try:
             with self.http.stream("GET", path) as response:
+                validate_response_versions(response.headers, status_code=response.status_code)
                 response.raise_for_status()
                 data = bytearray()
                 for chunk in response.iter_bytes():
@@ -85,18 +132,28 @@ class TacitClient:
             ) from None
 
     @contextmanager
-    def voice_socket(self, path: str) -> Iterator[Any]:
+    def voice_socket(self, path: str, *, max_size: int = 65536) -> Iterator[Any]:
         url = str(self.http.base_url).rstrip("/")
         url = url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         try:
             with connect(
                 url + path,
-                additional_headers={"Authorization": self.http.headers["Authorization"]},
+                additional_headers={
+                    "Authorization": self.http.headers["Authorization"],
+                    **protocol_headers(),
+                },
                 open_timeout=10,
-                max_size=65536,
+                max_size=max_size,
                 proxy=None,
             ) as socket:
+                if socket.response is not None:
+                    validate_response_versions(
+                        socket.response.headers, status_code=socket.response.status_code
+                    )
                 yield socket
+        except InvalidStatus as exc:
+            validate_response_versions(exc.response.headers, status_code=exc.response.status_code)
+            raise ClientError("Voice upload handshake rejected; local audio retained") from exc
         except (OSError, TimeoutError, WebSocketException) as exc:
             raise ClientError("Voice upload disconnected; local audio retained") from exc
 

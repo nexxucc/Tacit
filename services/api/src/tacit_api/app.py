@@ -46,6 +46,7 @@ from tacit_domain.knowledge import KnowledgeService
 from tacit_api.access import AccessService
 from tacit_api.answers import Answers
 from tacit_api.artifacts import Artifacts, Objects
+from tacit_api.compatibility import ProtocolCompatibility
 from tacit_api.db import (
     Credential,
     Installation,
@@ -159,7 +160,14 @@ def create_app(
                         )
                 await asyncio.sleep(60)
 
-        cleanup_task = asyncio.create_task(cleanup()) if access is not None else None
+        # Production persistence is PostgreSQL. Injected SQLite fixture engines can
+        # share one connection across threads, so concurrent maintenance would race
+        # request transactions on that connection. Exercise their pruning explicitly.
+        cleanup_task = (
+            asyncio.create_task(cleanup())
+            if access is not None and engine is not None and engine.dialect.name == "postgresql"
+            else None
+        )
         try:
             yield
         finally:
@@ -174,6 +182,8 @@ def create_app(
 
     app = FastAPI(title="Tacit API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(BodyLimit)
+    # Added after BodyLimit so declarations are checked before buffering uploads.
+    app.add_middleware(ProtocolCompatibility)
     # No production store/auth fallback. Only explicit demo mode creates fixture data.
     service = (
         KnowledgeService(DemoStore())
@@ -574,6 +584,12 @@ def create_app(
         except WebSocketDisconnect:
             return
 
+    @app.websocket("/v1/repos/{rid}/voice-sessions/{sid}/live")
+    async def voice_live(socket: WebSocket, rid: str, sid: str) -> None:
+        from tacit_api.live_voice import live_capture
+
+        await live_capture(socket, voice_sessions(), rid, sid)
+
     @app.post("/v1/repos/{rid}/voice-sessions/{sid}/finish", response_model=VoiceSessionView)
     def finish_voice_session(
         rid: str,
@@ -613,8 +629,11 @@ def create_app(
     @app.get("/v1/repos/{rid}/voice-capabilities")
     def voice_capabilities(rid: str, p: Principal = Depends(maintainer)) -> dict[str, object]:
         publications()
+        provider = speech if speech is not None else Prisma(settings.gnani_api_key)
         return {
             "configured": speech is not None or bool(settings.gnani_api_key),
+            "live_transcript": callable(getattr(provider, "transcribe_live", None))
+            and (speech is not None or bool(settings.gnani_api_key)),
             "max_seconds": 895,
             "rest_max_seconds": 30,
             "upload": "sequenced PCM; websocket or resumable HTTP",

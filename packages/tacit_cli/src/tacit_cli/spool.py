@@ -12,55 +12,105 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from tacit_cli.audio import AudioError
+from tacit_cli.local_storage import (
+    create_private_file,
+    make_private,
+    private_directory,
+    reject_link,
+    reject_redirected_path,
+    voice_path,
+)
 
 MAX_PCM = 895 * 32000
 
 
 def root() -> Path:
-    path = Path(os.environ.get("TACIT_VOICE_SPOOL", str(Path.home() / ".local/state/tacit/voice")))
-    if path.is_symlink():
-        raise AudioError("Voice spool must not be a symlink")
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.chmod(0o700)
+    path = voice_path()
+    try:
+        private_directory(path)
+    except OSError:
+        raise AudioError(
+            "Cannot secure the local voice spool; use a private local filesystem directory"
+        ) from None
     return path
 
 
 @contextmanager
 def capacity_lock() -> Iterator[None]:
+    path = root() / ".capacity.lock"
+    reject_redirected_path(path)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        import fcntl
-    except ImportError:
-        raise AudioError("Durable audio capture currently requires Linux") from None
-    fd = os.open(root() / ".capacity.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        make_private(path)
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                windows_crt: Any = msvcrt
+                windows_crt.locking(fd, windows_crt.LK_LOCK, 1)
+            except OSError:
+                raise AudioError(
+                    "Another Tacit process is updating local recordings; retry shortly"
+                ) from None
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)
 
 
 def atomic(path: Path, content: bytes) -> None:
-    temp = path.with_suffix(".tmp")
-    fd = os.open(temp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as file:
-        file.write(content)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temp, path)
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    reject_link(path)
+    reject_redirected_path(path.parent)
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        os.fsync(fd)
+        with create_private_file(temp) as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            windows: Any = ctypes
+            kernel = windows.WinDLL("kernel32", use_last_error=True)
+            kernel.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+            kernel.MoveFileExW.restype = wintypes.BOOL
+            # Same-directory replace plus write-through: Windows has no POSIX directory fsync.
+            for attempt in range(20):
+                if kernel.MoveFileExW(str(temp.absolute()), str(path.absolute()), 0x1 | 0x8):
+                    break
+                error = windows.get_last_error()
+                # An uploader may briefly have the manifest open without Windows
+                # delete sharing. Retry only that local handle contention.
+                if error not in {32, 33} or attempt == 19:
+                    raise windows.WinError(error)
+                time.sleep(0.025)
+        else:
+            os.replace(temp, path)
+            fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
     finally:
-        os.close(fd)
+        temp.unlink(missing_ok=True)
 
 
 class Spool:
     def __init__(self, sid: str):
         self.id = str(UUID(sid))
         self.path = root() / self.id
-        if self.path.is_symlink():
-            raise AudioError("Voice spool must not be a symlink")
-        self.meta: dict[str, Any] = json.loads((self.path / "manifest.json").read_text())
+        manifest = self.path / "manifest.json"
+        try:
+            reject_link(self.path)
+            reject_link(manifest)
+        except OSError:
+            raise AudioError("Voice spool must not use a symlink or reparse point") from None
+        self.meta: dict[str, Any] = json.loads(manifest.read_text(encoding="utf-8"))
         if self.meta["id"] != self.id:
             raise AudioError("Invalid spool manifest")
 
@@ -77,7 +127,7 @@ class Spool:
             raise AudioError("Three local recordings are retained; resume or forget one first")
         sid = str(uuid4())
         path = root() / sid
-        path.mkdir(mode=0o700)
+        private_directory(path)
         atomic(
             path / "manifest.json",
             json.dumps(
@@ -117,8 +167,10 @@ class Spool:
         if not 0 <= sequence < self.meta["chunks"]:
             raise AudioError("Missing recording chunk")
         path = self.path / f"{sequence:04d}.pcm"
-        if path.is_symlink():
-            raise AudioError("Invalid recording chunk")
+        try:
+            reject_link(path)
+        except OSError:
+            raise AudioError("Invalid recording chunk") from None
         with path.open("rb") as file:
             pcm = file.read(32001)
         if (

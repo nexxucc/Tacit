@@ -349,7 +349,9 @@ class TeachingService:
                     "unsupported_rule", "Use scheduler-v1 for extracted executable rules", 422
                 )
             answers = {**view.answers, **body.answers}
-            required = {key for key in view.questions if key.startswith(selected.id + ":")}
+            # Candidate IDs are opaque and can contain colons. Prefix matching
+            # would accidentally require questions from a different candidate.
+            required = {f"{selected.id}:{index}" for index in range(len(selected.questions))}
             required |= {f"scenario:{i}" for i in range(len(view.scenarios))}
             if any(
                 not isinstance(v, str) or not v.strip() or len(v) > 4000 for v in answers.values()
@@ -472,6 +474,10 @@ class TeachingService:
             raise
         with Session(self.manager.engine) as db, db.begin():
             item = self.scoped(db, p, rid, token, sid)
+            if item.status == "drafted" and item.payload.get("prepare_digest") == hashed:
+                completed = self.view(item)
+                if completed.draft is not None and completed.draft.id == draft.id:
+                    return completed
             if item.status != "processing":
                 raise DomainError("teaching_state", "Teaching run was cancelled", 409)
             item.payload = {

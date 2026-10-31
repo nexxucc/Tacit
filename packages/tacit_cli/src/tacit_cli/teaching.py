@@ -1,7 +1,6 @@
 """Grounded teaching commands and optional terminal review UI."""
 
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -21,6 +20,7 @@ from tacit_contracts.models import (
 )
 
 from tacit_cli.audio import AudioError
+from tacit_cli.local_storage import create_private_file
 
 app = typer.Typer(help="Extract candidates, clarify, and prepare a human-reviewed draft")
 
@@ -59,7 +59,7 @@ def extract(
             else (None if expected_snapshot == "none" else expected_snapshot)
         )
         selections = (
-            json.loads(selections_file.read_text())
+            json.loads(selections_file.read_text(encoding="utf-8"))
             if selections_file
             else [{"path": path, "captured_at": datetime.now(UTC).isoformat()} for path in files]
         )
@@ -76,7 +76,7 @@ def extract(
             files=tuple(files),
             expected_snapshot_id=base,
             transcript_operation_id=transcript_operation,
-            statement=text_file.read_text() if text_file else None,
+            statement=text_file.read_text(encoding="utf-8") if text_file else None,
             selections=tuple(Selection.model_validate(s) for s in selections),
         )
         typer.echo(
@@ -124,7 +124,7 @@ def answer(
     answer_file: Annotated[Path, typer.Option("--answer-file")],
 ) -> None:
     try:
-        body = ClarificationAnswer.model_validate_json(answer_file.read_text())
+        body = ClarificationAnswer.model_validate_json(answer_file.read_text(encoding="utf-8"))
         typer.echo(
             json.dumps(
                 request("POST", route(repo, run) + "/answers", body.model_dump(mode="json")),
@@ -178,9 +178,17 @@ def speak(
     voice: str = "Kaveri",
     language: str = "en-IN",
     output: Path | None = None,
+    output_device: Annotated[
+        int | None,
+        typer.Option(
+            "--output-device", help="Playback device ID from tacit audio devices --output"
+        ),
+    ] = None,
     operation_id: str | None = None,
 ) -> None:
     try:
+        if output is not None and output_device is not None:
+            raise ClientError("Choose --output to save audio or --output-device to play it")
         view = TeachingView.model_validate(request("GET", route(repo, run)))
         if question_id not in view.questions:
             raise ClientError("Select a listed clarification question")
@@ -207,13 +215,12 @@ def speak(
                 f"/v1/repos/{quote(repo, safe='')}/artifacts/{result['artifact_id']}"
             )
         if output:
-            fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "wb") as file:
+            with create_private_file(output) as file:
                 file.write(audio)
         else:
             from tacit_cli.audio import play
 
-            play(audio)
+            play(audio, device=output_device)
         typer.echo(json.dumps(result, indent=2))
     except (ClientError, ValueError, OSError, AudioError) as exc:
         typer.echo(str(exc), err=True)

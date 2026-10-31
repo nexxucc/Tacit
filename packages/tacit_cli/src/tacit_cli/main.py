@@ -3,7 +3,6 @@ import base64
 import io
 import json
 import math
-import os
 import platform
 import sys
 import time
@@ -17,11 +16,17 @@ from uuid import uuid4
 import httpx
 import typer
 from pydantic import TypeAdapter
-from tacit_client.client import ClientError, TacitClient
+from tacit_client.client import (
+    ClientError,
+    CompatibilityError,
+    TacitClient,
+    validate_response_versions,
+)
 from tacit_client.credentials import (
     CredentialError,
     api_url,
     delete_token,
+    keyring_setup_hint,
     save_token,
     secure_backend,
 )
@@ -37,8 +42,10 @@ from tacit_contracts.models import (
     VoiceRequest,
     VoiceSessionRequest,
 )
+from tacit_contracts.versions import protocol_headers
 
-from tacit_cli.audio import AudioError, devices, record
+from tacit_cli.audio import AudioError, audio_setup_hint, devices, output_devices, play, record
+from tacit_cli.local_storage import config_path, create_private_file, voice_path
 from tacit_cli.spool import Spool, sessions
 from tacit_cli.teaching import app as teaching_app
 from tacit_cli.voice_pipeline import record_session, resume
@@ -52,7 +59,7 @@ workspaces = typer.Typer()
 repos = typer.Typer()
 roles = typer.Typer()
 members = typer.Typer()
-audio = typer.Typer(help="Arch microphone diagnostics; no provider calls.")
+audio = typer.Typer(help="Arch audio devices, local recording and playback; no provider calls.")
 app.add_typer(audio, name="audio")
 app.add_typer(teaching_app, name="teaching")
 voice = typer.Typer(
@@ -164,7 +171,9 @@ def evaluate(
     agent: bool = False,
 ) -> None:
     try:
-        supplied = json.loads(scenario.read_text())
+        supplied = json.loads(scenario.read_text(encoding="utf-8"))
+        if not isinstance(supplied, dict):
+            raise ValueError("Scenario must be a JSON object")
         body = ScenarioRequest(
             snapshot_id=snapshot,
             source_commit=commit,
@@ -205,8 +214,14 @@ def doctor() -> None:
         json.dumps(
             {
                 "python": platform.python_version(),
+                "platform": platform.system(),
+                "architecture": platform.machine(),
                 "credential_mode": "OS keyring or explicit environment",
-                "audio": "Arch PortAudio; install audio extra and run tacit audio devices",
+                "keyring_setup": keyring_setup_hint(),
+                "audio": audio_setup_hint(),
+                "audio_devices": "tacit audio devices; tacit audio devices --output",
+                "config": str(config_path()),
+                "voice_spool": str(voice_path()),
                 "production_auth": "GitHub device flow; backend configuration required",
             },
             indent=2,
@@ -220,9 +235,14 @@ def login() -> None:
     try:
         secure_backend()
         with httpx.Client(
-            base_url=api_url(), timeout=30, trust_env=False, follow_redirects=False
+            base_url=api_url(),
+            timeout=30,
+            trust_env=False,
+            follow_redirects=False,
+            headers=protocol_headers(),
         ) as http:
             response = http.post("/v1/auth/device/start")
+            validate_response_versions(response.headers, status_code=response.status_code)
             response.raise_for_status()
             pairing = response.json()
             typer.echo(f"Open {pairing['verification_uri']} and enter {pairing['user_code']}")
@@ -233,6 +253,7 @@ def login() -> None:
                 response = http.post(
                     "/v1/auth/device/poll", json={"pairing_token": pairing["pairing_token"]}
                 )
+                validate_response_versions(response.headers, status_code=response.status_code)
                 response.raise_for_status()
                 result = response.json()
                 if result["status"] == "authorized":
@@ -250,10 +271,10 @@ def login() -> None:
                     raise CredentialError("GitHub authorization was denied")
                 interval = result["interval"]
             raise CredentialError("GitHub pairing expired; run tacit login again")
-    except (CredentialError, httpx.HTTPError, ValueError, KeyError) as exc:
+    except (CredentialError, CompatibilityError, httpx.HTTPError, ValueError, KeyError) as exc:
         message = (
             str(exc)
-            if isinstance(exc, CredentialError)
+            if isinstance(exc, (CredentialError, CompatibilityError))
             else "GitHub pairing failed; check backend configuration/connectivity"
         )
         typer.echo(message, err=True)
@@ -361,7 +382,9 @@ def teach(
     operation = operation_id or str(uuid4())
     try:
         statement = text_file.read_text(encoding="utf-8")
-        rule = Rule.model_validate_json(rule_file.read_text()) if rule_file else None
+        rule = (
+            Rule.model_validate_json(rule_file.read_text(encoding="utf-8")) if rule_file else None
+        )
         with TacitClient() as client:
             if expected_snapshot is None:
                 head = TypeAdapter(dict[str, str | None]).validate_python(
@@ -399,10 +422,31 @@ def teach(
 
 
 @audio.command("devices")
-def audio_devices() -> None:
+def audio_devices(
+    output: Annotated[
+        bool, typer.Option("--output", help="List output devices instead of inputs")
+    ] = False,
+) -> None:
     try:
-        typer.echo(json.dumps(devices(), indent=2))
+        typer.echo(json.dumps(output_devices() if output else devices(), indent=2))
     except AudioError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+
+
+@audio.command("play")
+def audio_play(
+    wav_file: Annotated[Path, typer.Argument(help="Local PCM16 WAV to play")],
+    device: Annotated[int | None, typer.Option("--device", help="Output device index")] = None,
+) -> None:
+    """Play a local WAV on the selected output device without provider calls."""
+    try:
+        with wav_file.open("rb") as source:
+            clip = source.read(28640045)
+        if len(clip) > 28640044:
+            raise AudioError("Local audio exceeds the playback size limit")
+        play(clip, device=device)
+    except (AudioError, OSError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
 
@@ -418,7 +462,10 @@ def audio_test(
 ) -> None:
     """Capture locally; optionally save a private WAV. No upload or transcription."""
     try:
-        typer.echo("Recording: Enter stops; Ctrl+C cancels. Audio will be discarded.", err=True)
+        typer.echo(
+            "Recording: p + Enter pauses; r + Enter resumes; Enter finishes; Ctrl+C cancels.",
+            err=True,
+        )
         clip = record(seconds, device)
         with wave.open(io.BytesIO(clip), "rb") as wav:
             samples = array.array("h", wav.readframes(wav.getnframes()))
@@ -426,8 +473,7 @@ def audio_test(
             samples.byteswap()
         rms = math.sqrt(sum(float(v) * v for v in samples) / len(samples)) / 32768 if samples else 0
         if output:
-            fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "wb") as file:
+            with create_private_file(output) as file:
                 file.write(clip)
         typer.echo(
             json.dumps(
@@ -466,6 +512,13 @@ def teach_voice(
             help="Durable sequenced capture/upload; --clip uses the legacy short WAV path",
         ),
     ] = True,
+    live_transcript: Annotated[
+        bool,
+        typer.Option(
+            "--live-transcript",
+            help="Send microphone audio to Prisma while recording and show provisional transcript segments",
+        ),
+    ] = False,
     device: int | None = None,
     language: str = "en-IN",
     operation_id: Annotated[str | None, typer.Option("--operation-id")] = None,
@@ -474,6 +527,8 @@ def teach_voice(
     """Record/upload recoverable audio and create a private draft; confirmation publishes."""
     operation = operation_id or str(uuid4())
     try:
+        if live_transcript and (audio_file is not None or not stream):
+            raise ClientError("--live-transcript requires microphone capture with --stream")
         with TacitClient() as client:
             # Establish authenticated access before touching the microphone.
             capabilities = client.request("GET", f"/v1/repos/{encoded(repo)}/voice-capabilities")
@@ -481,6 +536,8 @@ def teach_voice(
                 raise ClientError(
                     "Prisma is not configured on the backend; use tacit audio test for local capture"
                 )
+            if live_transcript and capabilities.get("live_transcript") is not True:
+                raise ClientError("This backend does not support live transcript capture")
             head = TypeAdapter(dict[str, str | None]).validate_python(
                 client.request("GET", f"/v1/repos/{encoded(repo)}/head")
             )
@@ -503,13 +560,23 @@ def teach_voice(
                 )
                 with redirect_stdout(sys.stderr):
                     if not typer.confirm(
-                        "Record/upload this session and send it to Prisma? Transcription may consume credits.",
+                        (
+                            "Send microphone audio to Prisma while recording and show provisional transcripts? "
+                            "Transcription starts immediately and may consume credits even if capture is cancelled."
+                            if live_transcript
+                            else "Record/upload this session and send it to Prisma? Transcription may consume credits."
+                        ),
                         err=True,
                     ):
                         typer.echo("Cancelled; no recording or transcription started.", err=True)
                         return
                 durable = record_session(
-                    repo, source, seconds=seconds, device=device, audio_file=audio_file
+                    repo,
+                    source,
+                    seconds=seconds,
+                    device=device,
+                    audio_file=audio_file,
+                    live_transcript=live_transcript,
                 )
                 typer.echo(json.dumps(durable, indent=2))
                 return
@@ -519,7 +586,10 @@ def teach_voice(
                 if len(clip) > 961_024:
                     raise AudioError("Audio file exceeds the short-clip size limit")
             else:
-                typer.echo("Recording: Enter stops; Ctrl+C cancels before upload.", err=True)
+                typer.echo(
+                    "Recording: p + Enter pauses; r + Enter resumes; Enter finishes; Ctrl+C cancels before upload.",
+                    err=True,
+                )
                 clip = record(seconds, device)
             body = VoiceRequest.model_validate(
                 {
@@ -612,8 +682,7 @@ def voice_export(recording: str, output: Annotated[Path, typer.Option("--output"
             retained.forget()
             raise AudioError("Local recording retention expired")
         retained.digest()
-        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as file, wave.open(file, "wb") as wav:
+        with create_private_file(output) as file, wave.open(file, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(16000)

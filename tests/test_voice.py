@@ -285,7 +285,7 @@ def test_capture_valid_wav_bounded_queue_errors_and_cancel(monkeypatch):
     assert device.closed
     for mode in ["overflow", "device"]:
         device = Capture(mode)
-        with pytest.raises(AudioError, match="discarded"):
+        with pytest.raises(AudioError, match="retained recording is incomplete"):
             record(0.01, sd=device, interactive=False)
         assert device.closed
     device = Capture("start_cancel")

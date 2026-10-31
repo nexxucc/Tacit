@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Checkout-scoped install; no public package publishing or executable replacement.
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != '--audio' ) ]]; then
+  echo 'Usage: install-arch.sh [--audio]' >&2
+  exit 2
+fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 command -v uv >/dev/null || { echo 'Install uv first.' >&2; exit 1; }
 launcher_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
 launcher="$launcher_dir/tacit-intent"
-if [[ -e "$launcher" ]] || command -v tacit-intent >/dev/null; then
+if [[ -e "$launcher" || -L "$launcher" ]] || command -v tacit-intent >/dev/null; then
   echo 'tacit-intent already exists. Inspect it before installing this checkout.' >&2
   exit 1
 fi

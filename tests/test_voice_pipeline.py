@@ -412,8 +412,8 @@ def test_prisma_exact_framing_headers_pacing_segment_dedup_and_failures(caplog):
     assert "secret" not in caplog.text and "fixture-only" not in caplog.text
 
 
-@pytest.mark.parametrize("indexes", [[1, 2], [0, 2]])
-def test_prisma_noncanonical_indexes_preserve_paid_output_for_correction(indexes):
+@pytest.mark.parametrize("indexes,complete", [([1, 2], True), ([0, 2], False)])
+def test_prisma_segment_indexes_preserve_paid_output_and_detect_gaps(indexes, complete):
     sock = Socket(
         [
             dict(type="transcript", segment_id=str(i), segment_index=i, text=f"Segment {i}.")
@@ -434,7 +434,7 @@ def test_prisma_noncanonical_indexes_preserve_paid_output_for_correction(indexes
             idle_timeout=0.01,
         )
     )
-    assert not result.complete
+    assert result.complete is complete
     assert [s["segment_index"] for s in result.segments] == indexes
     assert result.text == "\n".join(f"Segment {i}." for i in indexes)
 

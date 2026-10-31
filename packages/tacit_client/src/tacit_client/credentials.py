@@ -1,6 +1,7 @@
 """Credentials are scoped to the API origin; no plaintext storage fallback."""
 
 import os
+import sys
 from urllib.parse import urlparse
 
 import keyring
@@ -9,6 +10,14 @@ from keyring.errors import KeyringError
 
 class CredentialError(RuntimeError):
     pass
+
+
+def keyring_setup_hint() -> str:
+    if sys.platform == "win32":
+        return "Use Windows Credential Manager in your signed-in Windows user session"
+    if sys.platform == "darwin":
+        return "Unlock your login Keychain and allow the Tacit Python process to use it"
+    return "Start an unlocked Secret Service or KWallet keyring in your desktop session"
 
 
 def api_url() -> str:
@@ -37,7 +46,10 @@ def secure_backend() -> None:
         "keyring.backends.Windows",
         "keyring.backends.macOS",
     }:
-        raise CredentialError("An OS secure keyring is required; plaintext storage is disabled")
+        raise CredentialError(
+            "An OS secure keyring is required; plaintext storage is disabled. "
+            + keyring_setup_hint()
+        )
 
 
 def load_token(agent: bool) -> str:
@@ -56,7 +68,9 @@ def save_token(value: str) -> None:
         secure_backend()
         keyring.set_password("tacit:" + api_url(), "human", value)
     except KeyringError:
-        raise CredentialError("Cannot save the credential in the OS keyring") from None
+        raise CredentialError(
+            "Cannot save the credential in the OS keyring. " + keyring_setup_hint()
+        ) from None
 
 
 def delete_token() -> None:
@@ -65,4 +79,6 @@ def delete_token() -> None:
         if keyring.get_password("tacit:" + api_url(), "human"):
             keyring.delete_password("tacit:" + api_url(), "human")
     except KeyringError:
-        raise CredentialError("Cannot remove the credential from the OS keyring") from None
+        raise CredentialError(
+            "Cannot remove the credential from the OS keyring. " + keyring_setup_hint()
+        ) from None

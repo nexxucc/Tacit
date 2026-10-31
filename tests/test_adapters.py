@@ -1,5 +1,6 @@
 import asyncio
 import json
+import platform
 
 import httpx
 import pytest
@@ -43,12 +44,17 @@ def test_mcp_read_surface_only() -> None:
         "evaluate_scenario",
         "get_decision_history",
     }
+    assert all(t.annotations.readOnlyHint for t in tools)
+    assert all(t.annotations.destructiveHint is False for t in tools)
 
 
 def test_cli_machine_output_and_missing_credential(monkeypatch: pytest.MonkeyPatch) -> None:
     result = CliRunner().invoke(app, ["doctor"])
     assert result.exit_code == 0
-    assert "Arch PortAudio" in json.loads(result.stdout)["audio"]
+    diagnostic = json.loads(result.stdout)
+    assert diagnostic["platform"] == platform.system()
+    assert "PortAudio" in diagnostic["audio"]
+    assert diagnostic["config"] and diagnostic["voice_spool"]
     monkeypatch.delenv("TACIT_AGENT_TOKEN", raising=False)
     result = CliRunner().invoke(app, ["workspaces", "list", "--agent"])
     assert result.exit_code == 1 and not result.stdout
@@ -116,3 +122,28 @@ def test_ask_timeout_covers_reasoning_and_preserves_operation_id(monkeypatch, re
     assert json.loads(result.stdout)["answer"] == "Fixture answer"
     assert observed[0][1] == (150 if reason else 15)
     assert observed[0][0]["operation_id"] == ("stable-question-operation" if reason else None)
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", '"not an object"', "12"])
+def test_evaluate_rejects_non_object_json_before_api(tmp_path, monkeypatch, payload):
+    import tacit_cli.main as cli
+
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(payload)
+    monkeypatch.setattr(cli, "run", lambda *args, **kwargs: pytest.fail("Must not call API"))
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "evaluate",
+            "--scenario",
+            str(scenario),
+            "--repo",
+            "fixture",
+            "--snapshot",
+            "s",
+            "--commit",
+            "a" * 40,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "Scenario must be a JSON object" in result.stderr

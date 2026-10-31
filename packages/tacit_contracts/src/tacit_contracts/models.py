@@ -12,6 +12,8 @@ from pydantic import (
     model_validator,
 )
 
+from tacit_contracts.versions import EVALUATOR_VERSION
+
 
 class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -194,7 +196,7 @@ class EvaluationResponse(Contract):
     snapshot_id: str
     decision: Outcome
     rule_references: tuple[str, ...]
-    evaluator_version: str = "typed-equality-v1"
+    evaluator_version: str = EVALUATOR_VERSION
     usage: Usage = Field(default_factory=Usage)
 
 

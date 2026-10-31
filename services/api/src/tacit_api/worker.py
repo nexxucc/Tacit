@@ -94,9 +94,12 @@ def reconcile(access: AccessService, limit: int = 20) -> int:
             )
         ]
     for token_hash, provider_token in tokens:
-        if not provider_token:
-            continue
         try:
+            if not provider_token:
+                # A malformed/legacy human credential cannot be reconciled or
+                # used. Retire it instead of leaving it permanently at the front
+                # of every bounded batch, starving valid credentials behind it.
+                raise DomainError("unauthenticated", "Provider credential unavailable", 401)
             eligible = access.github.eligibility(access.decrypt(provider_token))
             with Session(access.engine) as db, db.begin():
                 credential = access.credential(db, token_hash)

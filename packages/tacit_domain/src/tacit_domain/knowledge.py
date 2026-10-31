@@ -8,6 +8,7 @@ from tacit_contracts.models import (
     EvaluationResponse,
     ScenarioRequest,
 )
+from tacit_contracts.versions import EVALUATOR_VERSION
 
 from tacit_domain.access import DomainError, Principal, authorize
 from tacit_domain.rules import evaluate
@@ -122,7 +123,7 @@ class KnowledgeService:
             snapshot_id=snap.id,
             decision=result,
             rule_references=references,
-            evaluator_version="typed-expression-v2",
+            evaluator_version=EVALUATOR_VERSION,
         )
 
     def history(

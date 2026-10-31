@@ -1,5 +1,6 @@
 """Opt-in, snapshot-scoped model answers with validated revision citations."""
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from tacit_contracts.models import CitedAnswer, ContextResponse, QuestionRequest
@@ -22,30 +23,40 @@ class Answers:
         repo = self.knowledge.repository(p, rid)
         kind = "question-agent" if p.agent else "question-human"
         hashed = fingerprint(request.model_dump(mode="json"))
-        with Session(self.manager.engine) as db, db.begin():
-            key = (repo.workspace_id, rid, p.user_id, request.operation_id, kind)
-            prior = db.get(ModelOperation, key, with_for_update=True)
-            if prior:
-                if prior.request_digest != hashed:
-                    raise DomainError("idempotency_conflict", "Question input changed", 409)
-                if prior.status != "completed":
-                    raise DomainError(
-                        "model_outcome_uncertain",
-                        "Question was attempted; it will not be replayed automatically",
-                        409,
+        try:
+            with Session(self.manager.engine) as db, db.begin():
+                key = (repo.workspace_id, rid, p.user_id, request.operation_id, kind)
+                prior = db.get(ModelOperation, key, with_for_update=True)
+                if prior:
+                    if prior.request_digest != hashed:
+                        raise DomainError("idempotency_conflict", "Question input changed", 409)
+                    if prior.status != "completed":
+                        raise DomainError(
+                            "model_outcome_uncertain",
+                            "Question was attempted; it will not be replayed automatically",
+                            409,
+                        )
+                    return ContextResponse.model_validate(prior.result)
+                db.add(
+                    ModelOperation(
+                        workspace_id=repo.workspace_id,
+                        repository_id=rid,
+                        author_id=p.user_id,
+                        operation_id=request.operation_id,
+                        kind=kind,
+                        request_digest=hashed,
+                        status="processing",
                     )
-                return ContextResponse.model_validate(prior.result)
-            db.add(
-                ModelOperation(
-                    workspace_id=repo.workspace_id,
-                    repository_id=rid,
-                    author_id=p.user_id,
-                    operation_id=request.operation_id,
-                    kind=kind,
-                    request_digest=hashed,
-                    status="processing",
                 )
-            )
+        except IntegrityError:
+            # SELECT FOR UPDATE cannot lock a row that does not exist yet.
+            # The unique key still reserves one attempt; a concurrent loser
+            # must receive a safe conflict without starting another generation.
+            raise DomainError(
+                "model_outcome_uncertain",
+                "Concurrent question already reserved this operation; it will not be replayed automatically",
+                409,
+            ) from None
         return None
 
     async def answer(
@@ -59,6 +70,7 @@ class Answers:
             or context.truncated
             or not context.decisions
             or context.applicability != "confirmed"
+            or context.warnings
         ):
             return context.model_copy(
                 update={
@@ -66,7 +78,7 @@ class Answers:
                     "answer_kind": "none",
                     "warnings": context.warnings
                     + (
-                        "Synthesis needs complete, applicable context starting at cursor zero; narrow the query or increase the limit.",
+                        "Synthesis needs complete, applicable context without unresolved warnings and starting at cursor zero; review applicability, narrow the query or increase the limit.",
                     ),
                 }
             )

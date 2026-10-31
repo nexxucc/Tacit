@@ -234,6 +234,17 @@ class AccessService:
                     self.audit(db, uid, wid, "role.bootstrap", {"role": Role.ADMIN.value})
                 if personal_owner:
                     self.add_role(db, uid, wid, Role.MAINTAINER)
+            elif (
+                membership is not None and membership.active and invited and not membership.invited
+            ):
+                # A former organization member can later be explicitly enrolled
+                # as an outside collaborator. Accept the scoped invitation, but
+                # never undo a local suspension through provider synchronization.
+                membership.invited = True
+                assert invitation is not None
+                for rid in invitation.repository_ids:
+                    self.add_role(db, uid, wid, Role.LEARNER, rid)
+                self.audit(db, uid, wid, "membership.invitation_accepted", {})
             # A local suspension stays suspended, even after a new GitHub sign-in.
 
     def credential(self, db: Session, token_hash: str) -> Credential:
@@ -294,8 +305,17 @@ class AccessService:
                 ):
                     continue
                 memberships.add(wid)
+                invitation = db.get(Invitation, (wid, user.github_id))
+                # Accepted outside-collaborator access remains scoped to the
+                # invitation even if old organization-wide grants still exist.
+                # Expiry limits acceptance, not an already accepted membership.
+                invited_repositories = (
+                    set(invitation.repository_ids) if invitation is not None else set()
+                )
                 for repo in item.repositories:
                     rid = f"gh-{repo.id}"
+                    if not (personal_owner or item.member) and rid not in invited_repositories:
+                        continue
                     stored = db.get(Repository, (wid, rid))
                     if stored and stored.enabled and (not row.agent or rid in row.repository_ids):
                         repositories.add(rid)

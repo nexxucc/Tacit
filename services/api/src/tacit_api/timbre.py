@@ -16,8 +16,15 @@ from tacit_api.publication import fingerprint
 
 
 class Timbre:
-    def __init__(self, key: str, artifacts: Artifacts):
+    def __init__(
+        self,
+        key: str,
+        artifacts: Artifacts,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.key, self.artifacts = key, artifacts
+        self.transport = transport
 
     def reserve(
         self, p: Principal, rid: str, token: str, body: SpeakRequest
@@ -61,7 +68,9 @@ class Timbre:
             return prior
         try:
             async with asyncio.timeout(90):
-                async with httpx.AsyncClient(timeout=85, trust_env=False) as client:
+                async with httpx.AsyncClient(
+                    timeout=85, trust_env=False, follow_redirects=False, transport=self.transport
+                ) as client:
                     async with client.stream(
                         "POST",
                         "https://api.vachana.ai/api/v1/tts/inference",
@@ -87,14 +96,22 @@ class Timbre:
                             if len(audio) > 20000000:
                                 raise ValueError("Audio exceeds budget")
             with wave.open(io.BytesIO(audio), "rb") as wav:
-                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 48000):
+                if (
+                    wav.getnchannels(),
+                    wav.getsampwidth(),
+                    wav.getframerate(),
+                    wav.getcomptype(),
+                ) != (1, 2, 48000, "NONE"):
                     raise ValueError("Invalid output format")
+                frames = wav.getnframes()
+                if not 0 < frames <= 10_000_000 or len(wav.readframes(frames)) != frames * 2:
+                    raise ValueError("Empty or truncated output audio")
             fresh = await run_in_threadpool(self.artifacts.manager.access.principal, token)
             result = await run_in_threadpool(self.artifacts.create, fresh, rid, token, bytes(audio))
             result = {**result, "usage": {"tts_calls": 1}}
             await run_in_threadpool(self.finish, fresh, rid, token, body, result)
             return result
-        except (httpx.HTTPError, TimeoutError, ValueError, wave.Error) as exc:
+        except (httpx.HTTPError, TimeoutError, ValueError, wave.Error, EOFError) as exc:
             raise DomainError(
                 "synthesis_failed",
                 "Synthesis failed; this operation will not be automatically replayed",

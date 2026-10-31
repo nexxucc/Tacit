@@ -6,7 +6,7 @@ import hashlib
 import io
 import logging
 import wave
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 from sqlalchemy import select
@@ -17,7 +17,7 @@ from tacit_domain.access import DomainError, Principal
 from tacit_api.db import TeachingDraft, VoiceAttempt, VoiceSession, VoiceTranscript
 from tacit_api.providers import ProviderUnavailable, SpeechToText
 from tacit_api.publication import PublicationService, fingerprint
-from tacit_api.streaming import StreamResult, transcribe_pcm
+from tacit_api.streaming import SegmentCallback, StreamResult, transcribe_chunks, transcribe_pcm
 
 MAX_AUDIO_BYTES = 961_024
 MAX_REQUEST_BYTES = 1_300_000
@@ -53,6 +53,15 @@ class Prisma:
 
     async def transcribe_stream(self, pcm: bytes, *, language: str = "en-IN") -> "StreamResult":
         return await transcribe_pcm(self.key, pcm, language)
+
+    async def transcribe_live(
+        self,
+        chunks: AsyncIterator[bytes],
+        *,
+        language: str = "en-IN",
+        on_segment: SegmentCallback | None = None,
+    ) -> StreamResult:
+        return await transcribe_chunks(self.key, chunks, language, on_segment=on_segment)
 
     async def transcribe(self, audio: bytes, sample_rate: int, *, language: str = "en-IN") -> str:
         if not self.key:

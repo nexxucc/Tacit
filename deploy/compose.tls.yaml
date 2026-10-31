@@ -1,0 +1,26 @@
+# Explicit opt-in: compose.yaml remains loopback-only without this overlay.
+services:
+  api:
+    environment:
+      # Only Caddy/the private Compose network and host loopback can reach this
+      # listener. Never publish port 8000 on a public address with this setting.
+      FORWARDED_ALLOW_IPS: "*"
+  caddy:
+    image: caddy:2
+    environment:
+      TACIT_PUBLIC_HOST: ${TACIT_PUBLIC_HOST:?Set the public DNS hostname without a scheme}
+      TACIT_ACME_EMAIL: ${TACIT_ACME_EMAIL:?Set an ACME certificate contact email}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+volumes:
+  caddy-data:
+  caddy-config:

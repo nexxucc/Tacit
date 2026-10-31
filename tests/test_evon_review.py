@@ -29,7 +29,8 @@ def backend(engine, monkeypatch):
         calls.append(data)
         if schema is CitedAnswer:
             return CitedAnswer(
-                answer="The evidence conflicts.", revision_ids=("a-restriction", "z-permission")
+                answer="The returned evidence is the only context available.",
+                revision_ids=tuple(d["revision_id"] for d in data["decisions"]),
             ), Usage(reasoning_calls=1)
         return CandidateSet.model_validate(
             {
@@ -164,8 +165,12 @@ def test_unchanged_failed_preparation_can_retry_and_completed_result_is_immutabl
         assert session.scalar(select(func.count()).select_from(Draft)) == 1
 
 
-@pytest.mark.parametrize("cursor,limit", [(1, 20), (0, 1)])
-def test_synthesis_requires_the_entire_scoped_context(backend, cursor, limit):
+@pytest.mark.parametrize(
+    "cursor,limit,stale_restriction", [(1, 20, False), (0, 1, False), (0, 20, True)]
+)
+def test_synthesis_requires_the_entire_applicable_scoped_context(
+    backend, cursor, limit, stale_restriction
+):
     client, owner, db, calls = backend
     with Session(db) as session, session.begin():
         session.add(
@@ -186,7 +191,7 @@ def test_synthesis_requires_the_entire_scoped_context(backend, cursor, limit):
                 revision_id=rid,
                 statement=statement,
                 files=("worker.py",),
-                source_commit=COMMIT,
+                source_commit="c" * 40 if stale_restriction and rid == "a-restriction" else COMMIT,
                 evidence=(Evidence(decision_id=rid, revision_id=rid, segment_id=rid, kind="text"),),
             )
             session.add(
@@ -233,8 +238,17 @@ def test_synthesis_requires_the_entire_scoped_context(backend, cursor, limit):
         "/v1/repos/gh-101/questions", headers=owner, json={**body, "cursor": 0, "limit": 20}
     )
     assert complete.status_code == 200, complete.text
-    assert complete.json()["answer_kind"] == "cited_reasoning"
-    assert {d["revision_id"] for d in calls[0]["decisions"]} == {"a-restriction", "z-permission"}
+    if stale_restriction:
+        # A complete page still omits retained decisions whose applicability
+        # needs review. Exact retrieval is useful, but synthesis must abstain.
+        assert complete.json()["answer_kind"] == "none"
+        assert not calls
+    else:
+        assert complete.json()["answer_kind"] == "cited_reasoning"
+        assert {d["revision_id"] for d in calls[0]["decisions"]} == {
+            "a-restriction",
+            "z-permission",
+        }
 
 
 def test_inflight_preparation_rejects_duplicate_until_completed(backend, monkeypatch):

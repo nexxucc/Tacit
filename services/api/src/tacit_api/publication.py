@@ -33,6 +33,7 @@ from tacit_api.db import (
     Snapshot,
     SnapshotMember,
     TeachingDraft,
+    TeachingRun,
     VoiceAttempt,
     VoiceSession,
     VoiceTranscript,
@@ -290,6 +291,31 @@ class PublicationService:
             prior = self.existing_draft(db, rid, p.user_id, body.operation_id, request_digest)
             if prior:
                 return self.view(db, prior)
+            if grounding is not None:
+                # Serialize cancellation against the final draft insert. A
+                # post-insert check in TeachingService alone leaves a standalone
+                # confirmable draft behind when cancellation wins this race.
+                run_id = grounding.get("run_id")
+                if not isinstance(run_id, str):
+                    raise DomainError("teaching_state", "Teaching provenance is invalid", 409)
+                run = db.get(TeachingRun, (repo.workspace_id, rid, run_id), with_for_update=True)
+                expected_prepare = fingerprint(
+                    {
+                        "operation_id": body.operation_id,
+                        "expected_version": grounding.get("version"),
+                        "decision_id": body.decision_id,
+                    }
+                )
+                if (
+                    run is None
+                    or run.author_id != p.user_id
+                    or run.status != "processing"
+                    or run.version != grounding.get("version")
+                    or run.payload.get("prepare_digest") != expected_prepare
+                ):
+                    raise DomainError(
+                        "teaching_state", "Teaching preparation is no longer active", 409
+                    )
             if (
                 voice is not None
                 and voice.session_id is not None
@@ -357,6 +383,17 @@ class PublicationService:
                     payload=view.model_dump(mode="json"),
                 )
             )
+            if grounding is not None:
+                # Complete preparation in the same transaction as its draft.
+                # Otherwise cancellation can win after this insert commits but
+                # before TeachingService records its immutable result.
+                assert run is not None
+                run.payload = {
+                    **run.payload,
+                    "view": {**run.payload["view"], "draft": view.model_dump(mode="json")},
+                }
+                run.status = "drafted"
+                run.version += 1
             db.add(
                 AuditEvent(
                     id=str(uuid4()),

@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[import-untyped]
+from cryptography.fernet import InvalidToken
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from tacit_domain.access import DomainError, Principal
@@ -99,6 +101,7 @@ class Artifacts:
         with Session(self.manager.engine) as db, db.begin():
             db.scalar(select(User).where(User.id == p.user_id).with_for_update(key_share=True))
             repo = self.manager.write_repository(db, p, rid, token)
+            workspace_id = repo.workspace_id
             count = len(
                 list(
                     db.scalars(
@@ -128,7 +131,16 @@ class Artifacts:
                     expires_at=now() + timedelta(seconds=300),
                 )
             )
-        self.objects.put(key, encrypted)
+        # Keep the pending row locked while storage is writing. Otherwise retention can
+        # delete/tombstone the pending object before a slow upload finishes, leaving
+        # newly written bytes behind a tombstone that cleanup will never revisit.
+        with Session(self.manager.engine) as db, db.begin():
+            pending = db.get(Artifact, (workspace_id, rid, aid), with_for_update=True)
+            if pending is None or pending.deleted_at or valid_time(pending.expires_at) <= now():
+                raise DomainError(
+                    "artifact_deleted", "Artifact upload was cancelled or expired", 410
+                )
+            self.objects.put(key, encrypted)
         fresh = self.manager.access.principal(token)
         with Session(self.manager.engine) as db, db.begin():
             item = self.scoped(db, fresh, rid, token, aid)
@@ -148,7 +160,22 @@ class Artifacts:
             item = self.scoped(db, p, rid, token, aid)
             if item.deleted_at or item.status != "ready" or valid_time(item.expires_at) <= now():
                 raise DomainError("artifact_deleted", "Artifact expired or deleted", 410)
-            data = self.manager.access.cipher.decrypt(self.objects.get(item.object_key))
+            try:
+                encrypted = self.objects.get(item.object_key)
+            except (OSError, BotoCoreError, ClientError):
+                raise DomainError(
+                    "artifact_unavailable", "Artifact storage is temporarily unavailable", 503
+                ) from None
+            except ValueError:
+                raise DomainError(
+                    "artifact_corrupt", "Artifact failed integrity validation", 409
+                ) from None
+            try:
+                data = self.manager.access.cipher.decrypt(encrypted)
+            except InvalidToken:
+                raise DomainError(
+                    "artifact_corrupt", "Artifact failed integrity validation", 409
+                ) from None
             if len(data) != item.bytes or hashlib.sha256(data).hexdigest() != item.sha256:
                 raise DomainError("artifact_corrupt", "Artifact failed integrity validation", 409)
             return data

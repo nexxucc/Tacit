@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+import unicodedata
 import wave
 from pathlib import Path
 from urllib.parse import quote
@@ -10,7 +11,7 @@ from urllib.parse import quote
 import typer
 from tacit_client.client import ClientError, TacitClient
 from tacit_client.credentials import api_url
-from tacit_contracts.models import VoiceSessionRequest
+from tacit_contracts.models import VoiceSessionRequest, VoiceSessionView
 
 from tacit_cli.audio import AudioError, RecordingCancelled, capture_chunks
 from tacit_cli.spool import Spool
@@ -58,30 +59,45 @@ def upload(
         return start
     sid = quote(str(start["id"]), safe="")
     route = path(spool) + "/" + sid
-    # While recording, reload atomically written manifests without sharing mutable state.
-    with client.voice_socket(route + "/upload") as socket:
-        raw = json.loads(socket.recv(timeout=15))
-        if not isinstance(raw, dict):
-            raise ClientError("Invalid audio acknowledgement")
-        status: dict[str, object] = raw
-        sequence = int(str(status["chunks"]))
-        if sequence > spool.meta["chunks"]:
+    # An active pause can exceed the server's socket-idle deadline. Close the
+    # drained transport while paused, then reconnect using the durable sequence;
+    # this resumes upload only and never invokes or replays transcription.
+    status: dict[str, object] = start
+    sequence = int(str(start["chunks"]))
+    while True:
+        local = Spool(spool.id)
+        if sequence > local.meta["chunks"]:
             raise AudioError("Server has more chunks than the retained recording")
-        while True:
-            local = Spool(spool.id)
-            if sequence < local.meta["chunks"]:
-                socket.send(sequence.to_bytes(8, "big") + local.chunk(sequence))
-                raw = json.loads(socket.recv(timeout=15))
-                if not isinstance(raw, dict):
-                    raise ClientError("Invalid audio acknowledgement")
-                status = raw
-                if status.get("chunks") != sequence + 1:
-                    raise ClientError("Audio acknowledgement failed; resume retained recording")
-                sequence += 1
-            elif recording is not None and recording.is_set():
+        if sequence == local.meta["chunks"]:
+            if recording is not None and recording.is_set():
                 time.sleep(0.1)
-            else:
-                break
+                continue
+            break
+        with client.voice_socket(route + "/upload") as socket:
+            raw = json.loads(socket.recv(timeout=15))
+            if not isinstance(raw, dict):
+                raise ClientError("Invalid audio acknowledgement")
+            status = raw
+            sequence = int(str(status["chunks"]))
+            while True:
+                local = Spool(spool.id)
+                if sequence > local.meta["chunks"]:
+                    raise AudioError("Server has more chunks than the retained recording")
+                if sequence < local.meta["chunks"]:
+                    socket.send(sequence.to_bytes(8, "big") + local.chunk(sequence))
+                    raw = json.loads(socket.recv(timeout=15))
+                    if not isinstance(raw, dict):
+                        raise ClientError("Invalid audio acknowledgement")
+                    status = raw
+                    if status.get("chunks") != sequence + 1:
+                        raise ClientError("Audio acknowledgement failed; resume retained recording")
+                    sequence += 1
+                elif recording is not None and recording.is_set():
+                    if local.meta["status"] == "paused":
+                        break
+                    time.sleep(0.1)
+                else:
+                    break
     local = Spool(spool.id)
     if local.meta["status"] != "recorded":
         return status  # captured partial audio stays unpublished
@@ -99,7 +115,262 @@ def upload(
     return result
 
 
+def _live_result(spool: Spool, result: object) -> dict[str, object]:
+    view = VoiceSessionView.model_validate(result)
+    if (
+        view.id != spool.meta["backend_id"]
+        or view.operation_id != spool.meta["source"]["operation_id"]
+        or view.repository_id != spool.meta["repo"]
+        or view.status not in {"completed", "needs_correction"}
+        or view.chunks != spool.meta["chunks"]
+        or view.pcm_bytes != spool.meta["bytes"]
+        or view.capture_complete != spool.meta["capture_complete"]
+        or view.audio_sha256 != spool.digest()
+    ):
+        raise ClientError("Live transcript result does not match the retained recording")
+    spool.forget()
+    return view.draft.model_dump(mode="json") if view.draft else view.model_dump(mode="json")
+
+
+def _record_live_session(spool: Spool, *, seconds: float, device: int | None) -> dict[str, object]:
+    """One billable socket, with provisional output separate from authoritative JSON."""
+    capturing, stopped, connected = threading.Event(), threading.Event(), threading.Event()
+    capturing.set()
+    errors: list[Exception] = []
+    results: list[object] = []
+    spool.meta["live_attempt"] = True
+    spool.save()
+
+    def sender() -> None:
+        try:
+            with TacitClient() as client:
+                checked_client(spool, client)
+                route = path(spool) + "/" + quote(str(spool.meta["backend_id"]), safe="")
+                with client.voice_socket(route + "/live", max_size=1_000_000) as socket:
+                    first = json.loads(socket.recv(timeout=20))
+                    if not isinstance(first, dict) or first.get("type") != "session":
+                        raise ClientError("Live transcript handshake failed")
+                    initial = VoiceSessionView.model_validate(first.get("session"))
+                    if (
+                        initial.id != spool.meta["backend_id"]
+                        or initial.operation_id != spool.meta["source"]["operation_id"]
+                        or initial.repository_id != spool.meta["repo"]
+                        or initial.chunks != 0
+                        or initial.pcm_bytes != 0
+                        or initial.status != "processing"
+                    ):
+                        raise ClientError("Live transcript session identity changed")
+                    connected.set()
+                    sequence = 0
+                    awaiting = False
+                    finishing = False
+                    finish_deadline = 0.0
+                    last_sent = time.monotonic()
+                    last_received = last_sent
+                    session_deadline = last_sent + 1015
+                    segments: dict[int, tuple[str, str]] = {}
+                    ids: dict[str, int] = {}
+                    text_size = 0
+                    while not stopped.is_set():
+                        now = time.monotonic()
+                        if now > session_deadline or (not finishing and now - last_received > 30):
+                            raise ClientError("Live transcript connection deadline exceeded")
+                        if finishing and now > finish_deadline:
+                            raise ClientError("Live transcription finalization deadline exceeded")
+                        local = Spool(spool.id)
+                        if not awaiting and not finishing:
+                            if sequence < local.meta["chunks"]:
+                                socket.send(sequence.to_bytes(8, "big") + local.chunk(sequence))
+                                awaiting = True
+                                last_sent = now
+                            elif not capturing.is_set():
+                                if local.meta["status"] != "recorded":
+                                    return
+                                socket.send(
+                                    json.dumps(
+                                        {
+                                            "type": "finish",
+                                            "chunks": local.meta["chunks"],
+                                            "audio_sha256": local.digest(),
+                                            "capture_complete": local.meta["capture_complete"],
+                                        }
+                                    )
+                                )
+                                finishing = True
+                                finish_deadline = now + 150
+                                last_sent = now
+                        if now - last_sent >= 5:
+                            socket.send(json.dumps({"type": "ping"}))
+                            last_sent = now
+                        try:
+                            event = json.loads(socket.recv(timeout=0.1))
+                        except TimeoutError:
+                            continue
+                        last_received = time.monotonic()
+                        if not isinstance(event, dict):
+                            raise ClientError("Invalid live transcript event")
+                        kind = event.get("type")
+                        if kind == "ack":
+                            if (
+                                not awaiting
+                                or type(event.get("chunks")) is not int
+                                or event["chunks"] != sequence + 1
+                            ):
+                                raise ClientError("Invalid live audio acknowledgement")
+                            sequence += 1
+                            awaiting = False
+                        elif kind == "transcript":
+                            item = event.get("segment")
+                            if not isinstance(item, dict):
+                                raise ClientError("Invalid provisional transcript segment")
+                            index, sid, text = (
+                                item.get("segment_index"),
+                                item.get("segment_id"),
+                                item.get("text"),
+                            )
+                            if (
+                                type(index) is not int
+                                or not 0 <= index < 10000
+                                or not isinstance(sid, str)
+                                or not 0 < len(sid) <= 256
+                                or not isinstance(text, str)
+                                or not text.strip()
+                                or len(text) > 120000
+                            ):
+                                raise ClientError("Invalid provisional transcript segment")
+                            if (index in segments and segments[index] != (sid, text)) or (
+                                sid in ids and ids[sid] != index
+                            ):
+                                raise ClientError("Conflicting provisional transcript segment")
+                            if index not in segments:
+                                text_size += len(text)
+                                if text_size > 120000:
+                                    raise ClientError(
+                                        "Provisional transcript exceeds the session limit"
+                                    )
+                                segments[index] = (sid, text)
+                                ids[sid] = index
+                                safe = "".join(
+                                    character
+                                    if not unicodedata.category(character).startswith("C")
+                                    and character not in {"\u2028", "\u2029"}
+                                    else " "
+                                    for character in text
+                                )
+                                typer.echo(
+                                    f"[Provisional transcript segment {index}] {safe}", err=True
+                                )
+                        elif kind == "result":
+                            if not finishing or awaiting:
+                                raise ClientError(
+                                    "Live result arrived before recording finalization"
+                                )
+                            results.append(event.get("session"))
+                            return
+                        elif kind == "error":
+                            raise ClientError(
+                                "Live transcription stopped; the provider request will not be replayed"
+                            )
+                        elif kind != "pong":
+                            raise ClientError("Unexpected live transcript event")
+        except Exception as exc:
+            errors.append(exc)
+            typer.echo(
+                "Live transcription disconnected. Finish or cancel recording; retained audio will not be replayed automatically.",
+                err=True,
+            )
+        finally:
+            connected.set()
+
+    worker = threading.Thread(target=sender, daemon=True)
+    worker.start()
+
+    def state(value: str) -> None:
+        spool.meta["status"] = "paused" if value == "paused" else "recording"
+        spool.save()
+        typer.echo(
+            "Microphone paused; r + Enter resumes, Enter finishes, Ctrl+C cancels. "
+            "The live provider connection stays open and may time out."
+            if value == "paused"
+            else "Microphone resumed; p + Enter pauses, Enter finishes, Ctrl+C cancels.",
+            err=True,
+        )
+
+    try:
+        if not connected.wait(timeout=25) or errors:
+            raise ClientError("Live transcript connection could not start")
+        typer.echo(
+            "Live transcription is active. Preview segments are provisional; review the final draft. "
+            "p + Enter pauses, r + Enter resumes, Enter finishes; Ctrl+C cancels.",
+            err=True,
+        )
+        for chunk in capture_chunks(seconds, device, on_state=state):
+            spool.append(chunk)
+            if errors or not worker.is_alive():
+                raise ClientError("Live transcription was interrupted")
+        if not spool.meta["chunks"]:
+            raise AudioError("No audio captured")
+        spool.meta["status"] = "recorded"
+        spool.meta["capture_complete"] = True
+        spool.save()
+        capturing.clear()
+        typer.echo("Capture finished; waiting for the final live transcript.", err=True)
+        deadline = time.monotonic() + 155
+        update = time.monotonic() + 15
+        while worker.is_alive() and time.monotonic() < deadline:
+            worker.join(timeout=0.5)
+            if time.monotonic() >= update:
+                typer.echo(
+                    "Still waiting for Prisma to finalize this live transcript; no audio replay is started.",
+                    err=True,
+                )
+                update = time.monotonic() + 15
+        if worker.is_alive() or errors or not results:
+            raise ClientError("Live transcription did not return a confirmed final result")
+        return _live_result(spool, results[0])
+    except RecordingCancelled:
+        stopped.set()
+        capturing.clear()
+        worker.join(timeout=15)
+        try:
+            with TacitClient() as client:
+                client.request(
+                    "DELETE", path(spool) + "/" + quote(str(spool.meta["backend_id"]), safe="")
+                )
+        finally:
+            spool.forget()
+        raise
+    except (ClientError, AudioError, OSError, ValueError, KeyboardInterrupt) as exc:
+        if spool.meta["status"] != "recorded":
+            spool.meta["status"] = "partial"
+            spool.save()
+        detail = f" {exc}" if isinstance(exc, AudioError) else ""
+        raise ClientError(
+            f"Live transcription interrupted; recording {spool.id} retained. "
+            "No provider reconnection or replay was attempted. Use voice resume to check for a saved result, "
+            "or voice export to inspect the audio." + detail
+        ) from exc
+    finally:
+        stopped.set()
+        capturing.clear()
+        worker.join(timeout=15)
+
+
 def resume(spool: Spool, *, accept_partial: bool = False) -> dict[str, object]:
+    if spool.meta.get("live_attempt"):
+        with TacitClient() as client:
+            checked_client(spool, client)
+            route = path(spool) + "/" + quote(str(spool.meta["backend_id"]), safe="")
+            result = client.request("GET", route)
+            if isinstance(result, dict) and result.get("status") in {
+                "completed",
+                "needs_correction",
+            }:
+                return _live_result(spool, result)
+            # The backend permits this only for an already saved transcript; its
+            # durable live reservation prevents replaying audio to the provider.
+            result = client.request("POST", route + "/transcribe", timeout=180)
+            return _live_result(spool, result)
     if spool.meta["status"] != "recorded":
         if not accept_partial or not spool.meta["chunks"]:
             raise AudioError(
@@ -142,11 +413,16 @@ def record_session(
     device: int | None,
     audio_file: Path | None,
     stream: bool = True,
+    live_transcript: bool = False,
 ) -> dict[str, object] | None:
+    if live_transcript and (audio_file is not None or not stream):
+        raise ClientError("Live transcription requires microphone capture with durable streaming")
     with TacitClient() as client:
         capabilities = client.request("GET", f"/v1/repos/{quote(repo, safe='')}/voice-capabilities")
         if not isinstance(capabilities, dict) or not capabilities.get("configured"):
             raise ClientError("Prisma is not configured; use tacit audio test for local recording")
+        if live_transcript and capabilities.get("live_transcript") is not True:
+            raise ClientError("This backend does not support live transcript capture")
         identity = client.request("GET", "/v1/auth/me")
         if not isinstance(identity, dict) or identity.get("agent") is not False:
             raise ClientError("Human maintainer permission is required")
@@ -169,6 +445,8 @@ def record_session(
             raise ClientError("Invalid voice session response")
     spool.meta["backend_id"] = preliminary["id"]
     spool.save()
+    if live_transcript:
+        return _record_live_session(spool, seconds=seconds, device=device)
     typer.echo(
         f"Recording ID: {spool.id}; operation: {source.operation_id}. Recover with: tacit voice resume {spool.id}",
         err=True,
@@ -187,6 +465,19 @@ def record_session(
     thread = threading.Thread(target=sender, daemon=True) if stream else None
     if thread:
         thread.start()
+
+    def capture_state(value: str) -> None:
+        # This state describes the currently running microphone only. A saved-session
+        # resume never reopens capture or silently appends a new recording.
+        spool.meta["status"] = "paused" if value == "paused" else "recording"
+        spool.save()
+        typer.echo(
+            "Microphone paused; r + Enter resumes, Enter finishes, Ctrl+C cancels."
+            if value == "paused"
+            else "Microphone resumed; p + Enter pauses, Enter finishes, Ctrl+C cancels.",
+            err=True,
+        )
+
     try:
         if audio_file:
             with wave.open(str(audio_file), "rb") as wav:
@@ -207,10 +498,11 @@ def record_session(
                     frames -= count
         else:
             typer.echo(
-                "Recording: Enter finishes; Ctrl+C cancels. Upload interruptions retain local audio.",
+                "Recording: p + Enter pauses, r + Enter resumes, Enter finishes; Ctrl+C cancels. "
+                "The duration limit counts active recording only. Upload interruptions retain local audio.",
                 err=True,
             )
-            for chunk in capture_chunks(seconds, device):
+            for chunk in capture_chunks(seconds, device, on_state=capture_state):
                 spool.append(chunk)
         if not spool.meta["chunks"]:
             raise AudioError("No audio captured")
@@ -231,8 +523,9 @@ def record_session(
     except (AudioError, OSError, wave.Error, KeyboardInterrupt) as exc:
         spool.meta["status"] = "partial"
         spool.save()
+        detail = f". {exc}" if isinstance(exc, AudioError) else ""
         raise AudioError(
-            f"Capture interrupted; recording {spool.id} retained for explicit partial recovery"
+            f"Capture interrupted; recording {spool.id} retained for explicit partial recovery{detail}"
         ) from exc
     finally:
         capturing.clear()
