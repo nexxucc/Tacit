@@ -110,3 +110,23 @@ def test_invalid_api_address_is_a_safe_configuration_error(monkeypatch, url):
     monkeypatch.setenv("TACIT_API_URL", url)
     with pytest.raises(CredentialError):
         api_url()
+
+
+def test_api_timeout_is_distinct_redacted_and_not_retried(monkeypatch):
+    import httpx
+    from tacit_client.client import ClientError, TacitClient
+
+    monkeypatch.setenv("TACIT_TOKEN", "fixture-human")
+    monkeypatch.setenv("TACIT_API_URL", "http://127.0.0.1:8000")
+    calls = []
+
+    def timed_out(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("SECRET provider payload", request=request)
+
+    with TacitClient(transport=httpx.MockTransport(timed_out)) as client:
+        with pytest.raises(ClientError, match="timed out") as error:
+            client.request("POST", "/v1/example")
+    assert len(calls) == 1
+    assert "SECRET" not in str(error.value)
+    assert "No automatic retry" in str(error.value)

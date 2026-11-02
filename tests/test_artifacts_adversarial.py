@@ -220,3 +220,20 @@ def test_corrupt_artifact_api_response_is_safe_and_correlated(runtime, monkeypat
     assert response.json()["code"] == "artifact_corrupt"
     assert response.json()["request_id"] == response.headers["X-Request-ID"]
     assert "private" not in response.text
+
+
+def test_synthesis_http_failure_diagnostics_are_redacted(runtime, caplog):
+    _, _, _, artifacts, principal, token = runtime
+
+    def respond(request):
+        return httpx.Response(403, json={"error": {"message": "SECRET provider details"}})
+
+    tts = Timbre("SECRET api key", artifacts, transport=httpx.MockTransport(respond))
+    body = SpeakRequest(operation_id=str(uuid4()), text="SECRET private text", voice="Kaveri")
+    with pytest.raises(DomainError) as error:
+        asyncio.run(tts.speak(principal, "gh-101", token, body))
+    assert error.value.code == "synthesis_failed"
+    assert (
+        "stage=http_status exception=HTTPStatusError http_status=403 audio_bytes=0" in caplog.text
+    )
+    assert "SECRET" not in caplog.text

@@ -256,3 +256,14 @@ def test_headless_review_refreshes_versions_and_requires_separate_confirmation(m
         "/v1/repos/gh-101/teaching-runs/run/draft",
     ]
     assert calls[0][2]["operation_id"] != calls[1][2]["operation_id"]
+
+
+def test_unknown_length_pcm_wav_is_finalized_without_changing_samples():
+    from tacit_api.timbre import finalize_wav_lengths
+
+    expected = pcm_wav()
+    streamed = expected[:4] + b"\xff" * 4 + expected[8:40] + b"\xff" * 4 + expected[44:]
+    assert finalize_wav_lengths(streamed) == expected
+    assert finalize_wav_lengths(expected[:-2]) == expected[:-2]  # Never repair ordinary truncation.
+    with pytest.raises(ValueError):
+        finalize_wav_lengths(streamed[:-1])

@@ -2,6 +2,8 @@
 
 import asyncio
 import io
+import logging
+import struct
 import wave
 
 import httpx
@@ -13,6 +15,33 @@ from tacit_domain.access import DomainError, Principal
 from tacit_api.artifacts import Artifacts
 from tacit_api.db import ModelOperation
 from tacit_api.publication import fingerprint
+
+logger = logging.getLogger("uvicorn.error.tacit.timbre")
+
+
+def finalize_wav_lengths(audio: bytes) -> bytes:
+    """Finalize an explicit unknown-length canonical PCM WAV, never a truncated file."""
+    if (
+        len(audio) >= 44
+        and audio[:4] == b"RIFF"
+        and audio[8:16] == b"WAVEfmt "
+        and audio[16:20] == struct.pack("<I", 16)
+        and audio[20:22] == struct.pack("<H", 1)
+        and audio[36:40] == b"data"
+        and audio[4:8] == b"\xff" * 4
+        and audio[40:44] == b"\xff" * 4
+    ):
+        payload = len(audio) - 44
+        if payload <= 0 or payload % 2:
+            raise ValueError("Empty or truncated output audio")
+        return (
+            audio[:4]
+            + struct.pack("<I", len(audio) - 8)
+            + audio[8:40]
+            + struct.pack("<I", payload)
+            + audio[44:]
+        )
+    return audio
 
 
 class Timbre:
@@ -66,6 +95,10 @@ class Timbre:
         prior = await run_in_threadpool(self.reserve, p, rid, token, body)
         if prior is not None:
             return prior
+        stage = "request"
+        status = None
+        audio_bytes = 0
+        wav_metadata = None
         try:
             async with asyncio.timeout(90):
                 async with httpx.AsyncClient(
@@ -89,13 +122,26 @@ class Timbre:
                             },
                         },
                     ) as response:
+                        stage = "http_status"
+                        status = response.status_code
                         response.raise_for_status()
+                        stage = "audio_body"
                         audio = bytearray()
                         async for chunk in response.aiter_bytes():
                             audio.extend(chunk)
+                            audio_bytes = len(audio)
                             if len(audio) > 20000000:
                                 raise ValueError("Audio exceeds budget")
+            stage = "wav_validation"
+            audio = bytearray(finalize_wav_lengths(bytes(audio)))
             with wave.open(io.BytesIO(audio), "rb") as wav:
+                wav_metadata = (
+                    wav.getnchannels(),
+                    wav.getsampwidth(),
+                    wav.getframerate(),
+                    wav.getcomptype(),
+                    wav.getnframes(),
+                )
                 if (
                     wav.getnchannels(),
                     wav.getsampwidth(),
@@ -106,12 +152,21 @@ class Timbre:
                 frames = wav.getnframes()
                 if not 0 < frames <= 10_000_000 or len(wav.readframes(frames)) != frames * 2:
                     raise ValueError("Empty or truncated output audio")
+            stage = "artifact_storage"
             fresh = await run_in_threadpool(self.artifacts.manager.access.principal, token)
             result = await run_in_threadpool(self.artifacts.create, fresh, rid, token, bytes(audio))
             result = {**result, "usage": {"tts_calls": 1}}
             await run_in_threadpool(self.finish, fresh, rid, token, body, result)
             return result
         except (httpx.HTTPError, TimeoutError, ValueError, wave.Error, EOFError) as exc:
+            logger.warning(
+                "Timbre failed: stage=%s exception=%s http_status=%s audio_bytes=%d wav_metadata=%s",
+                stage,
+                type(exc).__name__,
+                status,
+                audio_bytes,
+                wav_metadata,
+            )
             raise DomainError(
                 "synthesis_failed",
                 "Synthesis failed; this operation will not be automatically replayed",

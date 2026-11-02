@@ -144,7 +144,6 @@ def _record_live_session(spool: Spool, *, seconds: float, device: int | None) ->
     def sender() -> None:
         try:
             with TacitClient() as client:
-                checked_client(spool, client)
                 route = path(spool) + "/" + quote(str(spool.meta["backend_id"]), safe="")
                 with client.voice_socket(route + "/live", max_size=1_000_000) as socket:
                     first = json.loads(socket.recv(timeout=20))
@@ -339,7 +338,10 @@ def _record_live_session(spool: Spool, *, seconds: float, device: int | None) ->
                 )
         finally:
             spool.forget()
-        raise
+        raise RecordingCancelled(
+            "Recording cancelled; retained audio removed. "
+            "Prisma may already have processed audio and consumed credits."
+        ) from None
     except (ClientError, AudioError, OSError, ValueError, KeyboardInterrupt) as exc:
         if spool.meta["status"] != "recorded":
             spool.meta["status"] = "partial"
@@ -414,16 +416,23 @@ def record_session(
     audio_file: Path | None,
     stream: bool = True,
     live_transcript: bool = False,
+    preflight: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     if live_transcript and (audio_file is not None or not stream):
         raise ClientError("Live transcription requires microphone capture with durable streaming")
     with TacitClient() as client:
-        capabilities = client.request("GET", f"/v1/repos/{quote(repo, safe='')}/voice-capabilities")
+        capabilities = preflight or client.request(
+            "GET", f"/v1/repos/{quote(repo, safe='')}/voice-capabilities", timeout=60
+        )
         if not isinstance(capabilities, dict) or not capabilities.get("configured"):
             raise ClientError("Prisma is not configured; use tacit audio test for local recording")
         if live_transcript and capabilities.get("live_transcript") is not True:
             raise ClientError("This backend does not support live transcript capture")
-        identity = client.request("GET", "/v1/auth/me")
+        identity = (
+            {"user_id": capabilities["user_id"], "agent": False}
+            if isinstance(capabilities.get("user_id"), str)
+            else client.request("GET", "/v1/auth/me", timeout=60)
+        )
         if not isinstance(identity, dict) or identity.get("agent") is not False:
             raise ClientError("Human maintainer permission is required")
         # Reserve local capacity before allocating server storage. Keep the operation
@@ -436,10 +445,14 @@ def record_session(
         )
         typer.echo(f"Recording ID: {spool.id}; operation: {source.operation_id}", err=True)
         # Verify source/head before recording and before any paid call.
+        typer.echo(
+            "Preparing source-bound recording session; microphone is not recording yet.", err=True
+        )
         preliminary = client.request(
             "POST",
             f"/v1/repos/{quote(repo, safe='')}/voice-sessions",
             json=source.model_dump(mode="json"),
+            timeout=60,
         )
         if not isinstance(preliminary, dict):
             raise ClientError("Invalid voice session response")

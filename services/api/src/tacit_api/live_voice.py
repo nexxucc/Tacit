@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Any
@@ -16,7 +17,7 @@ from tacit_domain.access import DomainError, Principal
 from tacit_api.providers import ProviderUnavailable
 from tacit_api.voice_sessions import CHUNK_BYTES, VoiceSessions
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error.tacit.live")
 
 
 async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid: str) -> None:
@@ -30,14 +31,34 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
     sends = asyncio.Lock()
     queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=4)
     finalized = False
+    received_chunks = 0
+    remote_principal: Principal | None = None
 
-    async def authorized(*, statuses: set[str] | None = None) -> Principal:
-        fresh = await run_in_threadpool(manager.manager.access.principal, token)
+    async def authorized(*, statuses: set[str] | None = None, remote: bool = False) -> Principal:
+        started = time.monotonic()
+        fresh = (
+            await run_in_threadpool(manager.manager.access.principal, token)
+            if remote or remote_principal is None
+            else remote_principal
+        )
         view = await run_in_threadpool(manager.get, fresh, rid, token, sid)
         allowed = statuses if statuses is not None else {"processing"}
         if view.status not in allowed:
             raise DomainError("voice_state", "Live attempt is no longer active", 409)
+        elapsed = time.monotonic() - started
+        if elapsed >= 1:
+            logger.info("Live voice authorization slow: seconds=%.2f", elapsed)
         return fresh
+
+    async def revalidate() -> None:
+        nonlocal remote_principal
+        while True:
+            await asyncio.sleep(5)
+            # Bound remote access staleness to the interval plus this deadline.
+            # Local credential, membership, role and repository checks still run
+            # for every event through manager.get/write_repository.
+            async with asyncio.timeout(5):
+                remote_principal = await authorized(remote=True)
 
     async def send(event: dict[str, object]) -> None:
         # Serialize ACKs and previews; refresh authorization immediately before
@@ -72,7 +93,7 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
         await send({"type": "transcript", "segment": item})
 
     async def receive() -> None:
-        nonlocal finalized
+        nonlocal finalized, received_chunks
         while True:
             message = await asyncio.wait_for(socket.receive(), 20)
             if message["type"] == "websocket.disconnect":
@@ -97,6 +118,9 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
                 # A bounded queue supplies provider backpressure; acknowledged
                 # bytes remain durable even if the provider subsequently fails.
                 await asyncio.wait_for(queue.put(packet[8:]), 10)
+                received_chunks += 1
+                if received_chunks == 1 or received_chunks % 10 == 0:
+                    logger.info("Live voice durable audio: chunks=%d", received_chunks)
                 await send({"type": "ack", "chunks": view.chunks})
                 continue
             text = message.get("text")
@@ -114,6 +138,7 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
                 fresh = await authorized()
                 await run_in_threadpool(manager.finish_live, fresh, rid, token, sid, finish)
                 finalized = True
+                logger.info("Live voice capture finalized: chunks=%d", received_chunks)
                 await asyncio.wait_for(queue.put(None), 10)
                 # Keep this sole reader alive during final provider drain so
                 # disconnect/cancel can stop the provider promptly.
@@ -127,7 +152,7 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
         )
         if not finalized:
             raise ProviderUnavailable("Live provider completed before capture was finalized")
-        fresh = await authorized()
+        fresh = await authorized(remote=True)
         pcm = await run_in_threadpool(manager.live_pcm, fresh, rid, token, sid)
         await run_in_threadpool(
             manager.save_long,
@@ -155,6 +180,7 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
         if hasattr(manager.provider, "key") and not manager.provider.key:
             raise DomainError("provider_unconfigured", "Live provider is not configured", 503)
         p = await run_in_threadpool(manager.manager.access.principal, token)
+        remote_principal = p
         body, view = await run_in_threadpool(manager.reserve_live, p, rid, token, sid)
         reserved = True
         await socket.accept()
@@ -164,9 +190,13 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
         async with asyncio.timeout(1030):
             receiver = asyncio.create_task(receive())
             provider = asyncio.create_task(transcribe(body))
-            tasks.extend((receiver, provider))
+            watcher = asyncio.create_task(revalidate())
+            tasks.extend((receiver, provider, watcher))
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             # Prefer disconnect/protocol failure even if both tasks finish together.
+            if watcher in done:
+                await watcher
+                raise RuntimeError("Live authorization monitor stopped")
             if receiver in done:
                 await receiver
                 raise DomainError("voice_state", "Live capture ended unexpectedly", 409)
@@ -175,8 +205,13 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
             completed = True
             await socket.close(code=1000)
     except WebSocketDisconnect:
-        pass
+        logger.info(
+            "Live voice client disconnected: chunks=%d finalized=%s",
+            received_chunks,
+            finalized,
+        )
     except asyncio.CancelledError:
+        logger.info("Live voice cancelled: chunks=%d finalized=%s", received_chunks, finalized)
         raise
     except (
         DomainError,
@@ -186,9 +221,15 @@ async def live_capture(socket: WebSocket, manager: VoiceSessions, rid: str, sid:
         TimeoutError,
         OSError,
         RuntimeError,
-    ):
+    ) as exc:
         # Never echo exception text: SDK/provider payloads may contain transcripts
         # or credentials. An attempted operation stays reserved even on failure.
+        logger.warning(
+            "Live voice failed: exception=%s chunks=%d finalized=%s",
+            type(exc).__name__,
+            received_chunks,
+            finalized,
+        )
         if accepted:
             with suppress(Exception):
                 await send({"type": "error", "code": "live_transcription_failed"})

@@ -112,6 +112,11 @@ class TacitClient:
             raise ClientError(f"API error: {code} ({exc.response.status_code})") from None
         except ValueError:
             raise ClientError("Invalid JSON response from the Tacit API") from None
+        except httpx.TimeoutException:
+            raise ClientError(
+                "Tacit API request timed out; the backend may still be processing it. "
+                "No automatic retry was made."
+            ) from None
         except httpx.HTTPError:
             raise ClientError("Cannot reach the Tacit API") from None
 

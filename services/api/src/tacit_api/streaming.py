@@ -162,6 +162,7 @@ async def _transcribe_chunks(
                 or ready["config"].get("chunk_size") != 512
             ):
                 raise ValueError("Unexpected provider handshake")
+            logger.info("Prisma realtime handshake accepted; starting audio")
 
             async def receive() -> None:
                 nonlocal processing, transcript_chars
@@ -195,9 +196,16 @@ async def _transcribe_chunks(
                         or not sid
                         or len(sid) > 256
                         or not isinstance(text, str)
-                        or not text.strip()
                         or event.get("is_final", True) is not True
                     ):
+                        logger.warning(
+                            "Prisma transcript schema rejected: index_valid=%s id_valid=%s "
+                            "text_is_string=%s final_valid=%s",
+                            type(index) is int and 0 <= index < 10000,
+                            isinstance(sid, str) and 0 < len(sid) <= 256,
+                            isinstance(text, str),
+                            event.get("is_final", True) is True,
+                        )
                         raise ValueError("Invalid transcript segment")
                     item: dict[str, str | int] = {
                         "segment_index": index,
@@ -215,7 +223,7 @@ async def _transcribe_chunks(
                         raise ValueError("Transcript exceeds bounded session limit")
                     segments[index] = item
                     ids[sid] = index
-                    if on_segment is not None:
+                    if on_segment is not None and text.strip():
                         # Consumer backpressure is bounded independently from provider drain.
                         await asyncio.wait_for(on_segment(dict(item)), 10)
 
@@ -224,9 +232,10 @@ async def _transcribe_chunks(
                 stage = "audio_send"
                 pending = bytearray()
                 total = 0
+                next_progress = 320000
 
                 async def append(chunk: bytes) -> None:
-                    nonlocal total
+                    nonlocal total, next_progress
                     validate_chunk(chunk, total)
                     total += len(chunk)
                     pending.extend(chunk)
@@ -236,6 +245,9 @@ async def _transcribe_chunks(
                         # Cadence regulates buffered one-second capture chunks; audio
                         # arrives concurrently and is never replayed after capture.
                         await pause(0.032)
+                    if total >= next_progress:
+                        logger.info("Prisma realtime audio progress: seconds=%.2f", total / 32000)
+                        next_progress = total + 320000
 
                 await append(first)
                 async for chunk in iterator:
@@ -270,7 +282,7 @@ async def _transcribe_chunks(
                 # abandoned receive/source tasks and misleading unhandled errors.
                 await asyncio.gather(sender, receiver, return_exceptions=True)
         stage = "segment_validation"
-        if not segments:
+        if not segments or not any(str(item["text"]).strip() for item in segments.values()):
             raise ValueError("Empty or missing transcript segments")
         indexes = sorted(segments)
         # Current Gnani uses 1-based segment indexes. Retain the legacy 0-based
@@ -287,7 +299,11 @@ async def _transcribe_chunks(
         logger.info(
             "Prisma realtime received transcript: segments=%d complete=%s", len(ordered), complete
         )
-        return StreamResult("\n".join(str(s["text"]) for s in ordered), ordered, complete)
+        return StreamResult(
+            "\n".join(str(s["text"]) for s in ordered if str(s["text"]).strip()),
+            ordered,
+            complete,
+        )
     except (
         OSError,
         ValueError,

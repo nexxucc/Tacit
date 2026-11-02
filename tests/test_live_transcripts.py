@@ -344,7 +344,7 @@ def test_provider_live_indexes_are_preserved_and_gaps_fail_complete(events, comp
     "event",
     [
         {"type": "transcript", "segment_index": True, "segment_id": "one", "text": "bad"},
-        {"type": "transcript", "segment_index": 1, "segment_id": "one", "text": ""},
+        {"type": "transcript", "segment_index": 1, "segment_id": "one", "text": None},
         {
             "type": "transcript",
             "segment_index": 1,
@@ -422,3 +422,111 @@ def test_live_second_connection_cannot_reserve_or_replay_active_attempt(live_set
         result, _ = until(first, "result")
     assert result["session"]["status"] == "completed"
     assert calls == ["en-IN"] and row_state(db)[2:] == (1, 1)
+
+
+def test_live_audio_does_not_poll_github_for_every_chunk(live_setup, monkeypatch):
+    from tacit_api.access import AccessService
+
+    client, gh, db, speech = live_setup
+    owner = login(client, gh, db)
+    live_provider(speech, monkeypatch)
+    view, _ = start(client, owner)
+    calls = []
+    original = AccessService.principal
+
+    def counted(self, *args, **kwargs):
+        calls.append(time.monotonic())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AccessService, "principal", counted)
+    with client.websocket_connect(
+        f"/v1/repos/gh-101/voice-sessions/{view['id']}/live", headers=owner
+    ) as ws:
+        ws.receive_json()
+        for sequence in range(3):
+            ws.send_bytes(sequence.to_bytes(8, "big") + PCM)
+            until(ws, "ack")
+        # Admission is fresh, but audio/ACKs do not repeat external polling.
+        assert len(calls) == 1
+        finalize(ws, pcm=PCM * 3, chunks=3)
+        until(ws, "result")
+    assert len(calls) >= 2  # Final evidence delivery revalidates externally.
+
+
+def test_live_background_github_revocation_stops_idle_stream(live_setup, monkeypatch):
+    client, gh, db, speech = live_setup
+    owner = login(client, gh, db)
+    _, _, cancelled = live_provider(speech, monkeypatch)
+    view, _ = start(client, owner)
+    with client.websocket_connect(
+        f"/v1/repos/gh-101/voice-sessions/{view['id']}/live", headers=owner
+    ) as ws:
+        ws.receive_json()
+        ws.send_bytes(bytes(8) + PCM)
+        until(ws, "transcript")
+        gh.access = False
+        started = time.monotonic()
+        try:
+            until(ws, "error")
+        except WebSocketDisconnect:
+            pass
+        assert time.monotonic() - started < 10
+    assert cancelled
+
+
+def test_provider_empty_segment_preserves_indexes_without_blank_preview():
+    events = [
+        {"type": "transcript", "segment_index": i, "segment_id": str(i), "text": text}
+        for i, text in [(1, "First"), (2, ""), (3, "Last")]
+    ]
+    ws = Socket(events)
+    seen = []
+
+    async def source():
+        yield PCM
+
+    async def pause(_):
+        await asyncio.sleep(0)
+
+    async def segment(item):
+        seen.append(item)
+
+    result = asyncio.run(
+        transcribe_chunks(
+            "fixture-only",
+            source(),
+            "en-IN",
+            connector=lambda *a, **kw: ws,
+            pause=pause,
+            idle_timeout=0.001,
+            drain_timeout=0.05,
+            on_segment=segment,
+        )
+    )
+    assert result.text == "First\nLast"
+    assert [s["segment_index"] for s in result.segments] == [1, 2, 3]
+    assert [s["segment_index"] for s in seen] == [1, 3]
+    assert result.complete
+
+
+def test_provider_all_empty_segments_cannot_create_a_transcript():
+    ws = Socket([{"type": "transcript", "segment_index": 1, "segment_id": "one", "text": ""}])
+
+    async def source():
+        yield PCM
+
+    async def pause(_):
+        await asyncio.sleep(0)
+
+    with pytest.raises(ProviderUnavailable):
+        asyncio.run(
+            transcribe_chunks(
+                "fixture-only",
+                source(),
+                "en-IN",
+                connector=lambda *a, **kw: ws,
+                pause=pause,
+                idle_timeout=0.001,
+                drain_timeout=0.05,
+            )
+        )

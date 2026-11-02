@@ -2,6 +2,9 @@
 
 import hashlib
 import hmac
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -58,6 +61,23 @@ class EligibleInstallation:
 class GitHub:
     def __init__(self, client_id: str, app_id: int, transport: httpx.BaseTransport | None = None):
         self.client_id, self.app_id, self.transport = client_id, app_id, transport
+        self._requests = threading.local()
+
+    @contextmanager
+    def request_session(self) -> Iterator[httpx.Client]:
+        """Pool one synchronous operation; never share cookies across users or threads."""
+        existing = getattr(self._requests, "client", None)
+        if existing is not None:
+            yield existing
+            return
+        with httpx.Client(
+            timeout=15, transport=self.transport, follow_redirects=False, trust_env=False
+        ) as client:
+            self._requests.client = client
+            try:
+                yield client
+            finally:
+                del self._requests.client
 
     def request(
         self,
@@ -75,9 +95,7 @@ class GitHub:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
-            with httpx.Client(
-                timeout=15, transport=self.transport, follow_redirects=False, trust_env=False
-            ) as client:
+            with self.request_session() as client:
                 response = client.request(method, base + path, headers=headers, data=data)
         except httpx.HTTPError:
             raise DomainError("provider_unavailable", "GitHub is unreachable", 503) from None
@@ -146,6 +164,10 @@ class GitHub:
             ) from None
 
     def eligibility(self, token: str) -> tuple[EligibleInstallation, ...]:
+        with self.request_session():
+            return self._eligibility(token)
+
+    def _eligibility(self, token: str) -> tuple[EligibleInstallation, ...]:
         result = []
         try:
             for item in self.pages("/user/installations", token, "installations"):

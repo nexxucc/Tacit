@@ -531,7 +531,10 @@ def teach_voice(
             raise ClientError("--live-transcript requires microphone capture with --stream")
         with TacitClient() as client:
             # Establish authenticated access before touching the microphone.
-            capabilities = client.request("GET", f"/v1/repos/{encoded(repo)}/voice-capabilities")
+            typer.echo("Checking voice access and repository snapshot...", err=True)
+            capabilities = client.request(
+                "GET", f"/v1/repos/{encoded(repo)}/voice-capabilities", timeout=60
+            )
             if not isinstance(capabilities, dict) or capabilities.get("configured") is not True:
                 raise ClientError(
                     "Prisma is not configured on the backend; use tacit audio test for local capture"
@@ -539,7 +542,9 @@ def teach_voice(
             if live_transcript and capabilities.get("live_transcript") is not True:
                 raise ClientError("This backend does not support live transcript capture")
             head = TypeAdapter(dict[str, str | None]).validate_python(
-                client.request("GET", f"/v1/repos/{encoded(repo)}/head")
+                capabilities["head"]
+                if isinstance(capabilities.get("head"), dict)
+                else client.request("GET", f"/v1/repos/{encoded(repo)}/head", timeout=60)
             )
             if not isinstance(head, dict):
                 raise ClientError("Invalid knowledge head response")
@@ -577,6 +582,7 @@ def teach_voice(
                     device=device,
                     audio_file=audio_file,
                     live_transcript=live_transcript,
+                    preflight=capabilities,
                 )
                 typer.echo(json.dumps(durable, indent=2))
                 return

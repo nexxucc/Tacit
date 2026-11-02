@@ -353,9 +353,7 @@ def capture_chunks(
             if pending:
                 yield bytes(pending)
     except KeyboardInterrupt as exc:
-        raise RecordingCancelled(
-            "Recording cancelled; captured audio has not been transcribed"
-        ) from exc
+        raise RecordingCancelled("Recording cancelled") from exc
     except AudioError:
         raise
     except Exception as exc:

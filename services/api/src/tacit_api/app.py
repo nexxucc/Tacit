@@ -631,6 +631,8 @@ def create_app(
         publications()
         provider = speech if speech is not None else Prisma(settings.gnani_api_key)
         return {
+            "user_id": p.user_id,
+            "head": publications().head(p, rid),
             "configured": speech is not None or bool(settings.gnani_api_key),
             "live_transcript": callable(getattr(provider, "transcribe_live", None))
             and (speech is not None or bool(settings.gnani_api_key)),
