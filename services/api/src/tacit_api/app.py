@@ -1,7 +1,7 @@
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
@@ -40,6 +40,7 @@ from tacit_contracts.models import (
     VoiceSessionRequest,
     VoiceSessionView,
 )
+from tacit_contracts.snapshots import SnapshotExport
 from tacit_domain.access import DomainError, Principal
 from tacit_domain.knowledge import KnowledgeService
 
@@ -62,6 +63,7 @@ from tacit_api.db import (
 from tacit_api.demo import DemoStore, demo_principals, multi_user_principals
 from tacit_api.github import GitHub, verify_webhook
 from tacit_api.limits import BodyLimit
+from tacit_api.mcp_oauth import MCPAuth, RegisteredClient, safe_url
 from tacit_api.persistence import PostgreSQLStore
 from tacit_api.providers import SpeechToText
 from tacit_api.publication import PublicationService
@@ -94,6 +96,9 @@ class Settings(BaseSettings):
     artifact_endpoint: str = ""
     github_install_url: str = ""
     access_read_cache_seconds: int = Field(default=0, ge=0, le=60)
+    mcp_public_url: str = ""
+    mcp_clients: dict[str, RegisteredClient] = Field(default_factory=dict)
+    mcp_allowed_origins: list[str] = Field(default_factory=list)
 
 
 def create_app(
@@ -126,6 +131,8 @@ def create_app(
             settings.credential_encryption_key,
             settings.access_read_cache_seconds,
         )
+
+    remote_server = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -169,7 +176,10 @@ def create_app(
             else None
         )
         try:
-            yield
+            async with AsyncExitStack() as stack:
+                if remote_server is not None:
+                    await stack.enter_async_context(remote_server.session_manager.run())
+                yield
         finally:
             if cleanup_task:
                 cleanup_task.cancel()
@@ -287,6 +297,10 @@ def create_app(
                 for model in (TeachingRun, ModelOperation, Artifact, PublicationIndex):
                     db.execute(select(model).limit(1))
                 db.execute(select(PublicationReceipt.operation_id).limit(1))
+                if remote_server is not None:
+                    from tacit_api.db import MCPGrant
+
+                    db.execute(select(MCPGrant.id).limit(1))
         return {"status": "ready", "persistence": "postgresql"}
 
     @app.get("/v1/auth/me")
@@ -344,6 +358,29 @@ def create_app(
         rid: str, body: ScenarioRequest, p: Principal = Depends(principal)
     ) -> EvaluationResponse:
         return knowledge().evaluate(p, rid, body)
+
+    @app.get("/v1/repos/{rid}/snapshots/{sid}/export", response_model=SnapshotExport)
+    def export_snapshot(rid: str, sid: str, p: Principal = Depends(principal)) -> SnapshotExport:
+        repo, snap = knowledge().snapshot(p, rid, sid)
+        try:
+            if snap.manifest_digest is None:
+                raise ValueError("Missing manifest")
+            return SnapshotExport(
+                workspace_id=repo.workspace_id,
+                repository_id=rid,
+                repository_name=repo.full_name,
+                snapshot_id=snap.id,
+                source_commit=snap.source_commit,
+                parent_snapshot_id=snap.parent_snapshot_id,
+                manifest_digest=snap.manifest_digest,
+                decisions=tuple(sorted(snap.decisions, key=lambda d: d.revision_id)),
+            )
+        except ValueError:
+            raise DomainError(
+                "snapshot_export_invalid",
+                "Snapshot cannot be exported completely and consistently",
+                413,
+            ) from None
 
     @app.get("/v1/repos/{rid}/snapshots/{sid}")
     def snapshot(rid: str, sid: str, p: Principal = Depends(principal)) -> dict[str, object]:
@@ -780,5 +817,16 @@ def create_app(
             request.headers.get("X-GitHub-Event", ""),
             await request.body(),
         )
+
+    if settings.mcp_public_url:
+        if access is None or settings.demo:
+            raise ValueError(
+                "Remote MCP requires production GitHub authentication and durable persistence"
+            )
+        from tacit_api.mcp_remote import install_remote
+
+        provider = MCPAuth(access, settings.mcp_public_url, settings.mcp_clients)
+        origins = [safe_url(origin, origin=True) for origin in settings.mcp_allowed_origins]
+        remote_server = install_remote(app, provider, origins)
 
     return app

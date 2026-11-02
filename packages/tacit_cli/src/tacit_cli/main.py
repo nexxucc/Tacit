@@ -46,6 +46,9 @@ from tacit_contracts.versions import protocol_headers
 
 from tacit_cli.audio import AudioError, audio_setup_hint, devices, output_devices, play, record
 from tacit_cli.local_storage import config_path, create_private_file, voice_path
+from tacit_cli.snapshots import app as snapshot_app
+from tacit_cli.snapshots import failure as snapshot_failure
+from tacit_cli.snapshots import locked_context, read_lock, resolve_scope
 from tacit_cli.spool import Spool, sessions
 from tacit_cli.teaching import app as teaching_app
 from tacit_cli.voice_pipeline import record_session, resume
@@ -61,6 +64,7 @@ roles = typer.Typer()
 members = typer.Typer()
 audio = typer.Typer(help="Arch audio devices, local recording and playback; no provider calls.")
 app.add_typer(audio, name="audio")
+app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(teaching_app, name="teaching")
 voice = typer.Typer(
     help="Recover or cancel retained voice recordings; never automatically publish."
@@ -107,9 +111,13 @@ def list_repos(workspace: Annotated[str, typer.Option("--workspace")], agent: bo
 
 @app.command()
 def context(
-    repo: RepoOption,
-    snapshot: SnapshotOption,
-    commit: CommitOption,
+    repo: Annotated[str | None, typer.Option("--repo")] = None,
+    snapshot: Annotated[str | None, typer.Option("--snapshot")] = None,
+    commit: Annotated[str | None, typer.Option("--commit")] = None,
+    lock: Annotated[Path | None, typer.Option("--lock")] = None,
+    export: Annotated[
+        Path | None, typer.Option("--export", help="Read a pinned export offline; requires --lock")
+    ] = None,
     files: list[str] | None = None,
     limit: int = 20,
     cursor: int = 0,
@@ -118,7 +126,33 @@ def context(
         bool, typer.Option("--json", help="JSON is the scaffold's default output")
     ] = False,
 ) -> None:
-    """Retrieve exact confirmed text. Output is JSON in this scaffold."""
+    """Retrieve confirmed text online, or explicitly read an integrity-checked offline export."""
+    if lock is not None:
+        try:
+            pinned = read_lock(lock)
+            for supplied, expected in (
+                (repo, pinned.repository_id),
+                (snapshot, pinned.snapshot_id),
+                (commit, pinned.source_commit),
+            ):
+                if supplied is not None and supplied != expected:
+                    raise ValueError("Explicit scope conflicts with lockfile")
+            result = locked_context(
+                pinned,
+                files=tuple(files or ()),
+                limit=limit,
+                cursor=cursor,
+                agent=agent,
+                export=export,
+            )
+            typer.echo(result.model_dump_json(indent=2))
+            return
+        except (ValueError, OSError, ClientError, CredentialError) as exc:
+            snapshot_failure(exc)
+    if export is not None or repo is None or snapshot is None or commit is None:
+        raise typer.BadParameter(
+            "Supply --lock, or all of --repo, --snapshot and --commit; --export requires --lock"
+        )
     body = ContextRequest(
         snapshot_id=snapshot,
         source_commit=commit,
@@ -134,13 +168,15 @@ def context(
 @app.command()
 def ask(
     question: str,
-    repo: RepoOption,
-    snapshot: SnapshotOption,
-    commit: CommitOption,
+    repo: Annotated[str | None, typer.Option("--repo")] = None,
+    snapshot: Annotated[str | None, typer.Option("--snapshot")] = None,
+    commit: Annotated[str | None, typer.Option("--commit")] = None,
+    lock: Annotated[Path | None, typer.Option("--lock")] = None,
     agent: bool = False,
     reason: bool = False,
     operation_id: str | None = None,
 ) -> None:
+    repo, snapshot, commit = resolve_scope(repo, snapshot, commit, lock, agent=agent)
     operation = operation_id or str(uuid4()) if reason else None
     if reason:
         typer.echo(
@@ -165,11 +201,13 @@ def ask(
 @app.command()
 def evaluate(
     scenario: Annotated[Path, typer.Option("--scenario")],
-    repo: RepoOption,
-    snapshot: SnapshotOption,
-    commit: CommitOption,
+    repo: Annotated[str | None, typer.Option("--repo")] = None,
+    snapshot: Annotated[str | None, typer.Option("--snapshot")] = None,
+    commit: Annotated[str | None, typer.Option("--commit")] = None,
+    lock: Annotated[Path | None, typer.Option("--lock")] = None,
     agent: bool = False,
 ) -> None:
+    repo, snapshot, commit = resolve_scope(repo, snapshot, commit, lock, agent=agent)
     try:
         supplied = json.loads(scenario.read_text(encoding="utf-8"))
         if not isinstance(supplied, dict):

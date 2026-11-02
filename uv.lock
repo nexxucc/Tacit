@@ -1364,6 +1364,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "sqlalchemy" },
     { name = "tacit-domain" },
+    { name = "tacit-mcp" },
     { name = "uvicorn" },
     { name = "websockets" },
 ]
@@ -1379,6 +1380,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "tacit-domain", editable = "packages/tacit_domain" },
+    { name = "tacit-mcp", editable = "packages/tacit_mcp" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
     { name = "websockets", specifier = ">=15,<17" },
 ]
@@ -1461,7 +1463,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=1.12,<2" },
+    { name = "mcp", specifier = ">=1.30,<2" },
     { name = "tacit-client", editable = "packages/tacit_client" },
 ]
 

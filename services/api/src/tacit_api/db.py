@@ -431,3 +431,20 @@ class PublicationIndex(Base):
             ],
         ),
     )
+
+
+class MCPGrant(Base):
+    """Durable single-use OAuth flow; secrets are hashed or encrypted, never plaintext."""
+
+    __tablename__ = "mcp_grants"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    issuer: Mapped[str] = mapped_column(String(512))
+    client_id: Mapped[str] = mapped_column(String(128))
+    params: Mapped[dict[str, object]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16))
+    cookie_hash: Mapped[str | None] = mapped_column(String(64))
+    code_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    token_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    delegated_token: Mapped[str | None] = mapped_column(String(4096))
+    credential_hash: Mapped[str | None] = mapped_column(ForeignKey("credentials.token_hash"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

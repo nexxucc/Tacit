@@ -78,7 +78,7 @@ uv run --no-sync tacit-mcp
 uv run --no-sync tacit mcp
 ```
 
-Local MCP exposes `list_workspaces`, `list_repositories`, `get_context`, `ask_repository`, `evaluate_scenario` and `get_decision_history`. Configure a scoped agent credential privately in the host environment. MCP stdout contains protocol messages; diagnostics use stderr. Exact agent reads require zero STT/TTS calls. Remote MCP/OAuth is not implemented.
+Local MCP exposes `list_workspaces`, `list_repositories`, `get_context`, `ask_repository`, `evaluate_scenario` and `get_decision_history`. Configure a scoped agent credential privately in the host environment. MCP stdout contains protocol messages; diagnostics use stderr. Exact agent reads require zero STT/TTS calls. Optional Streamable HTTP with repository-scoped OAuth is implemented; see [Remote MCP with OAuth](#remote-mcp-with-oauth).
 
 ## Arch client and recording
 
@@ -429,7 +429,7 @@ Remaining user/external gates:
 - Human-authored 30-scenario evaluation with at least 10 held out, plus a bounded developer handoff study.
 - Production-shaped application recovery, deployed storage permissions, power-loss behavior and actual S3 acceptance if selected.
 
-Later implementation scope: remote MCP/OAuth, snapshot export/lockfiles, team mappings/custom roles, editor selection integrations, multi-maintainer approval quorum and offline teaching synchronization.
+Later implementation scope: team mappings/custom roles, editor selection integrations, multi-maintainer approval quorum and offline teaching synchronization. Snapshot export/lockfiles and opt-in remote MCP/OAuth are implemented as described below; live Codex remote OAuth discovery and pinned retrieval have passed; live revocation acceptance remains pending.
 
 ## Laptop HTTPS test endpoint
 
@@ -560,3 +560,86 @@ This verifies real PostgreSQL dump/restore, local encrypted-volume transfer/acti
 The latest code passed all three supported Python versions with disposable PostgreSQL: Python 3.12.15 — **576 passed, 28 skipped, zero failures/errors** in 128.03 seconds; Python 3.13.17 — **576 passed, 28 skipped, zero failures/errors** in 127.44 seconds; Python 3.14.8 — **576 passed, 28 skipped, zero failures/errors** in the earlier 411.85-second run. Each collected 604 cases; these are repeated interpreter runs, not additional distinct scenarios. Each run had twenty-two SQLite-specific skips with PostgreSQL counterparts executed, six explicit live Evon skips, and three existing Starlette test-library deprecation warnings. Timing differences are observations, not a controlled interpreter benchmark.
 
 The 3.12/3.13 runs used isolated temporary environments and cleared inherited provider/application credentials. Logs and JUnit reports are retained under `/tmp/tacit-python-matrix.lzlNBi`; the disposable test container was removed. The cross-filesystem uv hardlink fallback was nonfatal and affects installation copying rather than test correctness. This completes the current automated Python matrix; native Windows/macOS device acceptance and the unavailable live Evon workflow remain separate.
+
+
+## Snapshot export and lockfiles
+
+Use a lockfile to select a stable published snapshot without repeatedly pasting repository, commit and snapshot IDs. A lock pins one repository and API URL, its workspace, source commit, snapshot, manifest and complete export SHA-256, with explicit format/API/schema/evaluator versions. Creating a lock from the current head resolves that head once; later head changes do not move an existing lock. To update, deliberately create and review a new lockfile under a new output name. Existing files are never overwritten.
+
+```bash
+# Set this to your trusted Tacit API; the lock never selects a server automatically.
+export TACIT_API_URL=https://zodiac-bubbling-stereo.ngrok-free.dev
+
+# Optional --snapshot selects an older immutable snapshot instead of current head.
+uv run --no-sync tacit snapshot lock --repo gh-1406716088 --output tacit.lock.json
+
+# Online reads still need your human login, or --agent with TACIT_AGENT_TOKEN.
+uv run --no-sync tacit context --lock tacit.lock.json --files app/matcher.py
+uv run --no-sync tacit ask "What should happen for ambiguous routes?" --lock tacit.lock.json
+uv run --no-sync tacit evaluate --scenario examples/scenario.json --lock tacit.lock.json
+
+# Download complete published content and verify it against the pinned digest.
+uv run --no-sync tacit snapshot export --lock tacit.lock.json --output snapshot.json
+uv run --no-sync tacit snapshot verify --lock tacit.lock.json --export snapshot.json
+
+# Explicit offline operations: no network, provider calls or credentials needed.
+uv run --no-sync tacit snapshot verify --lock tacit.lock.json --export snapshot.json --offline
+uv run --no-sync tacit context --lock tacit.lock.json --export snapshot.json --files app/matcher.py
+```
+
+The scenario file must describe a domain supported by the repository's published typed rules; using a lock does not create those rules or turn text knowledge into an executable policy. `ask` remains exact confirmed-statement retrieval unless `--reason` is explicitly requested, which may consume Evon resources. `context`, `ask` and `evaluate` preserve their existing explicit-ID forms; supplied IDs conflicting with a lock fail before credentials or reasoning requests are sent. Online commands require `TACIT_API_URL` to match the pinned API URL, and revalidate access and content instead of silently falling back to an export or a newer head. The lock does not automatically verify the local checkout's Git HEAD; its commit pins the retrieved knowledge, so check your checkout or supply an explicit `--commit` to detect a mismatch.
+
+Exports use the authenticated read-only `GET /v1/repos/{rid}/snapshots/{sid}/export` endpoint. They contain published decisions, rules, source bindings and evidence references, including retained members from older commits; private drafts, access tokens and raw audio are excluded. A manifest must be consistent, revisions sorted/unique and the entire canonical payload at most 4 MB with at most 10,000 decisions. Oversized or inconsistent snapshots fail rather than producing a partial export. Agent reads remain read-only and scoped. Existing wire protocol versions are unchanged because this is an additive endpoint and CLI feature.
+
+Treat exports as private repository data. Files are created exclusively with the platform's private storage permissions and symlink-safe writer; choose deliberately before sharing or committing any export. Lockfiles contain identifiers and a server URL, not credentials, but can still disclose private repository metadata. JSON duplicates, incompatible versions, scope/content changes and output collisions are rejected. Offline context preserves file filtering, pagination, evidence, zero provider usage and warnings for older-commit knowledge. Its applicability only compares the pinned source commit with exported decisions; it does not establish current authorization, revocation status, local code applicability or server authenticity. Content hashes detect changes relative to a trusted lock; they are not signatures and an attacker able to replace both files can forge a self-consistent pair. No snapshot import, offline teaching sync or remote MCP transport is added.
+
+
+Snapshot/export verification: the full PostgreSQL-backed regression run passed **600 tests with 28 explained skips** on each of Python 3.12.15, 3.13.17 and 3.14.8. After final contract cleanup and two additional boundary cases, the focused snapshot/compatibility/CLI-MCP suite passed **102 tests with no skips** on each interpreter (26 snapshot feature cases per run). Ruff lint, formatting and strict mypy passed (51 source files). Contracts and CLI wheel/sdist builds succeeded and include the new modules. Tests cover online lock/export/context/question flows, unchanged explicit-ID commands through regression coverage, head movement, private-draft exclusion, scoped agent access/revocation, offline zero-network reads, retained-commit warnings, pagination, content/scope/version tampering, duplicate JSON keys, API-origin mismatch, size limits and safe output creation. All provider responses were fixtures; no Gnani/Evon requests, knowledge publications to real repositories or production database changes were made. The isolated PostgreSQL test container was removed. Logs/JUnit reports and source checksums are retained in `/tmp/tacit-snapshot-regression/`. A running backend must be restarted or redeployed to expose the new export endpoint; hosted/live user acceptance has not been performed.
+
+
+Hosted snapshot/lock acceptance subsequently passed on the ngrok-backed deployment. The operator created `tacit.lock.json` for Raahi snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81`, retrieved confirmed complete context with no warnings and zero provider usage, and downloaded `snapshot.json`. Independent CLI verification matched the downloaded content against the lock both offline and through fresh authenticated online access. An offline file-scoped read preserved revision `c54f153a-bfda-473c-bb54-347bf0bf8af8` and zero usage; both local files have mode 0600. This verifies the tested live pin/read/export/verification path without paid providers. The local knowledge export and lock are test artifacts and were not added to version control. Offline integrity remains distinct from current access or signed authenticity.
+
+### Raahi lockfile development pilot
+
+On 2026-11-02, a bounded Codex-assisted pilot used the published Raahi snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81` and source commit `2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd` to review the existing internal matcher change. Lock-based retrieval preserved decision `411b198f-f9c5-4fd0-870d-c91168ab9968` and revision `c54f153a-bfda-473c-bb54-347bf0bf8af8`. Fresh authenticated online verification passed. Offline context also succeeded with an unreachable API and provider credentials removed; modified policy text and an explicitly conflicting commit were rejected. All context usage counters were zero.
+
+The isolated Raahi checkout gained seven regression cases for exact distance thresholds, exact ambiguity margins, comparisons before display rounding, and ambiguity measured relative to the best segment. Its existing `candidate_route_ids` implementation was preserved. The full local Raahi suite passed: **60 tests on Python 3.13.17**, with focused Ruff and diff checks passing. Six deliberate mutations in disposable source copies were all detected, covering equality, premature rounding, an extra absolute candidate-distance cap, and omission of candidate IDs. Pilot receipts and mutation logs remain local in `output/raahi-lock-pilot/`; the uncommitted Raahi work remains in `output/raahi-handoff/checkout/`.
+
+This demonstrates using pinned knowledge during a bounded development/review task. The lock does not attest to dirty working-tree bytes or automatically check local Git HEAD. The policy was source-derived and the code was previously exposed, so this is not an independent human handoff or productivity comparison. No live feeds, paid providers, publication, commits or pushes were performed during this pilot. Remote MCP/OAuth was the next task after this pilot; its implementation is described below.
+
+## Remote MCP with OAuth
+
+Remote MCP is optional. Existing `tacit-mcp` stdio configuration continues to use `TACIT_AGENT_TOKEN`. The HTTP endpoint exposes exactly the same six tools at `/mcp`, using Streamable HTTP with stateless requests. OAuth tokens are audience-bound to that exact endpoint and cannot authenticate to the ordinary API; human/CLI/stdio credentials cannot authenticate to `/mcp`. GitHub eligibility, parent credential expiry/revocation, local roles and selected repository access are checked on subsequent requests. Nothing changes in an existing deployment until remote MCP is explicitly configured.
+
+To enable it on a deployment with PostgreSQL and GitHub authentication already configured:
+
+1. Install the frozen dependencies with `uv sync --frozen` (retain `--extra audio` if this checkout also provides microphone/playback commands), then run `uv run --no-sync alembic upgrade head` with that deployment's `TACIT_DATABASE_URL`. Migration `0007` creates durable OAuth grant storage. Back up an existing database before deployment. Do not run migrations against a different development/test database by accident.
+2. Set `TACIT_MCP_PUBLIC_URL` to the canonical public **origin**, such as `https://tacit.example.com` (no `/mcp` suffix, path, query, credentials or fragment). HTTP is allowed only for loopback development. The reverse proxy must preserve the public Host header and route `/mcp`, `/authorize`, `/token`, `/revoke`, `/oauth/consent`, and `/.well-known/*` to Tacit. Do not cache OAuth or authenticated responses.
+3. Register the client in `TACIT_MCP_CLIENTS`, using its exact callback URL. Example shell assignment: `export TACIT_MCP_CLIENTS='{"my-editor":{"name":"My editor","redirect_uris":["http://127.0.0.1:8345/callback"]}}'`. This is a **public** client with client ID `my-editor`, no client secret, authorization-code grant, and mandatory S256 PKCE. The callback here is an example; use the URL your actual client reports. Redirects must be HTTPS except for loopback callbacks. Dynamic client registration and client metadata URL fetching are intentionally unavailable; clients must support a pre-registered client ID.
+4. Restart the API, check `/health/ready`, and configure the MCP client for `<public-origin>/mcp` with the registered client ID and scope `tacit:read`. Clients must send the exact resource URI `<public-origin>/mcp` at authorization and token exchange. Discovery endpoints advertise the authorization server, PKCE support and protected resource. Native clients normally send no Origin header. For a browser-based MCP client, add its exact trusted origin to the JSON array `TACIT_MCP_ALLOWED_ORIGINS`; arbitrary origins and Host headers are rejected.
+5. In the opened Tacit consent page, sign in through GitHub's device page, return to Tacit, select repositories and click **Allow selected repositories**. No repositories are preselected. The browser keeps the human Tacit credential in page memory only; consent requires a same-origin request and browser-bound HttpOnly cookie. Client credentials never contain the GitHub provider token or the internal delegated credential.
+
+Authorization requests expire in ten minutes; codes expire within two minutes and are exchanged once, atomically. Access expires within one hour, bounded by the human sign-in lifetime. No refresh tokens are issued: reauthorize when needed. The client may revoke using `POST /revoke` with form fields `client_id` and `token`; revocation also disables the underlying delegation. Changing/removing the public origin or registered client invalidates its existing remote tokens. Only published repository knowledge is exposed; teaching/publication tools are absent. Explicit `ask_repository(reason=true, operation_id=...)` remains an opt-in model call and may consume resources.
+
+Grant records retain hashes of OAuth secrets and encrypted internal delegation, using the existing stable encryption key. Expired OAuth records are pruned when a new authorization begins. The access service retains its usual credential/audit lifecycle. Keep the database and encryption key in the existing private recovery process. A lockfile or snapshot export does not grant OAuth access.
+
+Local automated acceptance covers OAuth discovery and consent, all six tool reads against synthetic published knowledge, token audience separation, PKCE/redirect/state/resource checks, code replay, repository isolation, logout/GitHub/revocation/expiry, and an actual loopback Uvicorn connection using the MCP SDK client. These use fixture GitHub responses without paid providers. The operator subsequently completed the live Codex OAuth flow and supplied successful repository-scoped discovery and pinned retrieval output, recorded below. Live revocation remains a separate acceptance check. The implementation agent did not reconfigure the live deployment automatically.
+
+Automated verification on 2026-11-03: the full Python 3.14.8 project suite passed **684 tests, 30 skipped**, with the three existing Starlette deprecation warnings. The skips comprise six opt-in live Evon cases and 24 SQLite-only omissions whose PostgreSQL counterparts ran. A focused remote-MCP/CLI/compatibility/migration suite passed **160 tests, 2 skipped** on each of Python 3.12.15, 3.13.17 and 3.14.8; after the final public-client metadata adjustment, the complete remote MCP module was checked again on 3.12 (**82 passed, 2 skipped**). The new PostgreSQL-only cases exercise single-use code exchange and concurrent users with separate repository scopes. The socket test covers both an explicitly supplied OAuth token and automatic OAuth discovery/exchange with the official SDK client and fixture browser-consent handler. Live Codex OAuth read acceptance subsequently passed as recorded below; live revocation remains pending.
+
+Ruff, formatting, strict mypy (53 source modules), frozen-lock consistency, JavaScript syntax, diff checks, and API/MCP wheel and source builds passed. Only README was updated among Markdown source documents, and the AST code graph was refreshed. Logs and built artifacts are local in `/tmp/tacit-remote-mcp-regression/`. Automated tests used a separate disposable PostgreSQL container; that test run did not migrate or reconfigure the running application database or deployment. The operator subsequently enabled the live deployment for the acceptance check below.
+
+
+### Live remote MCP/OAuth progress — 2026-11-03
+
+The operator completed the Codex remote OAuth setup against `https://zodiac-bubbling-stereo.ngrok-free.dev/mcp` and supplied the resulting MCP read output. Mark the **live remote OAuth discovery and pinned-read path as passed** on this operator-supplied evidence; the implementation agent did not independently capture the browser consent or MCP trace.
+
+- Accessible scope contained only workspace `gh-149251890` and repository `gh-1406716088` (`nexxucc/raahi`), consistent with the selected repository delegation.
+- Context retrieved snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81` at source commit `2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd` for `app/matcher.py` and `tests/test_crowd.py`.
+- Returned provenance matched decision `411b198f-f9c5-4fd0-870d-c91168ab9968` and revision `c54f153a-bfda-473c-bb54-347bf0bf8af8`. Applicability was `confirmed`, status was `answered`, warnings were empty and retrieval was not truncated.
+- The returned route-hint restriction, distance/equality thresholds, ambiguity requirements and vehicle/direction limits matched the published statement. Its source-derived qualification was preserved. `answer_kind: none` represents retrieved statements, not provider synthesis.
+- All reported reasoning, STT, TTS and input/output token counters were zero. The operator reported no modification or publication.
+
+**Remaining for remote MCP acceptance:** revoke this live connection and verify that subsequent reads fail. Automated revocation, expiry, logout, audience separation and concurrent-user isolation checks have passed; this successful live read does not independently establish those live negative paths. Live remote OAuth acceptance is therefore partial, not complete.
+
+**Next implementation:** GitHub team-to-role mappings and custom roles. Editor source selection, multi-maintainer approval quorum and offline teaching synchronization remain later implementation work. Native platform and other external acceptance gates above remain separate; this update does not mark the entire project finished.

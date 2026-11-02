@@ -288,7 +288,7 @@ def test_mcp_inherits_version_rejection_before_consuming_tool_payload(monkeypatc
     mcp = server.create_server()
     tool = mcp._tool_manager.get_tool("list_workspaces")
     with pytest.raises(CompatibilityError):
-        tool.fn()
+        asyncio.run(tool.fn())
     assert [request.url.path for request in requests] == ["/v1/auth/me", "/v1/workspaces"]
 
 
