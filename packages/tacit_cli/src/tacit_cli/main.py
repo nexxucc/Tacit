@@ -45,7 +45,12 @@ from tacit_contracts.models import (
 from tacit_contracts.versions import protocol_headers
 
 from tacit_cli.audio import AudioError, audio_setup_hint, devices, output_devices, play, record
+from tacit_cli.editor import app as editor_app
 from tacit_cli.local_storage import config_path, create_private_file, voice_path
+from tacit_cli.offline import app as offline_app
+from tacit_cli.quorum import app as quorum_app
+from tacit_cli.roles import custom as custom_roles_app
+from tacit_cli.roles import teams as team_roles_app
 from tacit_cli.snapshots import app as snapshot_app
 from tacit_cli.snapshots import failure as snapshot_failure
 from tacit_cli.snapshots import locked_context, read_lock, resolve_scope
@@ -64,6 +69,9 @@ roles = typer.Typer()
 members = typer.Typer()
 audio = typer.Typer(help="Arch audio devices, local recording and playback; no provider calls.")
 app.add_typer(audio, name="audio")
+app.add_typer(editor_app, name="editor")
+app.add_typer(quorum_app, name="approvals")
+app.add_typer(offline_app, name="offline")
 app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(teaching_app, name="teaching")
 voice = typer.Typer(
@@ -73,6 +81,8 @@ app.add_typer(voice, name="voice")
 app.add_typer(workspaces, name="workspaces")
 app.add_typer(repos, name="repos")
 app.add_typer(roles, name="roles")
+app.add_typer(custom_roles_app, name="custom-roles")
+app.add_typer(team_roles_app, name="team-roles")
 app.add_typer(members, name="members")
 
 
@@ -794,7 +804,10 @@ def confirm(
                 expected_snapshot_id=view.expected_snapshot_id,
             )
             result = client.request(
-                "POST", f"/v1/repos/{encoded(repo)}/publications", json=body.model_dump(mode="json")
+                "POST",
+                f"/v1/repos/{encoded(repo)}/publications",
+                json=body.model_dump(mode="json"),
+                timeout=180,
             )
         typer.echo(json.dumps(result, indent=2))
     except (ClientError, ValueError) as exc:

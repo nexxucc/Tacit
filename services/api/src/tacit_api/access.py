@@ -12,7 +12,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 from tacit_contracts.models import AgentTokenRequest, InvitationRequest, Role, RoleChange
-from tacit_domain.access import DomainError, Grant, Principal, authorize
+from tacit_domain.access import DomainError, Principal, authorize
 
 from tacit_api.db import (
     AuditEvent,
@@ -271,16 +271,23 @@ class AccessService:
                 self._eligibility_cache.popitem(last=False)
         return verified
 
-    def principal(self, token: str, *, fresh: bool = True) -> Principal:
+    def principal(self, token: str, *, fresh: bool = True, team_grants: bool = True) -> Principal:
+        return self.principal_hash(digest(token), fresh=fresh, team_grants=team_grants)
+
+    def principal_hash(
+        self, token_hash: str, *, fresh: bool = True, team_grants: bool = True
+    ) -> Principal:
+        """Internal revalidation of a recorded credential; never an HTTP authenticator."""
         with Session(self.engine) as db, db.begin():
-            row = self.credential(db, digest(token))
+            row = self.credential(db, token_hash)
             parent = self.credential(db, row.parent_hash) if row.agent and row.parent_hash else row
             if parent.agent or not parent.provider_token:
                 raise DomainError("unauthenticated", "Invalid credential delegation", 401)
             user = db.get(User, row.user_id)
             if user is None or parent.user_id != row.user_id:
                 raise DomainError("unauthenticated", "Invalid credential subject", 401)
-            eligible = self.verified_eligibility(self.decrypt(parent.provider_token), fresh=fresh)
+            provider_token = self.decrypt(parent.provider_token)
+            eligible = self.verified_eligibility(provider_token, fresh=fresh)
             self.sync(db, user.id, user.github_id, eligible)
             db.flush()
             memberships: set[str] = set()
@@ -319,19 +326,29 @@ class AccessService:
                     stored = db.get(Repository, (wid, rid))
                     if stored and stored.enabled and (not row.agent or rid in row.repository_ids):
                         repositories.add(rid)
-            grants = tuple(
-                Grant(g.workspace_id, Role(g.role), g.repository_id)
-                for g in db.scalars(
-                    select(RoleAssignment).where(RoleAssignment.user_id == row.user_id)
-                )
-                if g.workspace_id in memberships
-            )
             if row.agent:
                 scoped_workspaces = {
                     r.workspace_id
                     for r in db.scalars(select(Repository).where(Repository.id.in_(repositories)))
                 }
                 memberships &= scoped_workspaces
+            from tacit_api.roles import effective_grants
+
+            organizations = {
+                f"gh-{item.installation.account.id}"
+                for item in eligible
+                if item.member and item.installation.account.type == "Organization"
+            }
+            grants = effective_grants(
+                self,
+                db,
+                row.user_id,
+                memberships,
+                provider_token=provider_token,
+                organizations=organizations,
+                repository_ids=repositories,
+                active_team_mappings=None if team_grants else frozenset(),
+            )
             return Principal(
                 row.user_id, row.agent, frozenset(memberships), frozenset(repositories), grants
             )

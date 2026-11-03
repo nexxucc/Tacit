@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal
 
 from tacit_contracts.models import Role
 
@@ -14,6 +15,8 @@ class Grant:
     workspace_id: str
     role: Role
     repository_id: str | None = None
+    source: Literal["direct", "custom_role", "github_team"] = "direct"
+    source_id: str | None = None
 
 
 @dataclass(frozen=True)

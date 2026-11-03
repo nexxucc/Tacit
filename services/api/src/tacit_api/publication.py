@@ -13,10 +13,9 @@ from tacit_contracts.models import (
     Evidence,
     PublicationRequest,
     PublicationResponse,
-    Role,
     VoiceEvidence,
 )
-from tacit_domain.access import DomainError, Grant, Principal, authorize
+from tacit_domain.access import DomainError, Principal, authorize
 
 from tacit_api.access import AccessService, digest
 from tacit_api.db import (
@@ -29,7 +28,6 @@ from tacit_api.db import (
     PublicationReceipt,
     Repository,
     RepositoryHead,
-    RoleAssignment,
     Snapshot,
     SnapshotMember,
     TeachingDraft,
@@ -55,6 +53,11 @@ class PublicationService:
         self.engine = access.engine
 
     def write_repository(self, db: Session, p: Principal, rid: str, token: str) -> Repository:
+        return self.write_repository_hash(db, p, rid, digest(token))
+
+    def write_repository_hash(
+        self, db: Session, p: Principal, rid: str, token_hash: str
+    ) -> Repository:
         if p.agent:
             raise DomainError("forbidden", "Human maintainer permission is required")
         repo = db.scalar(select(Repository).where(Repository.id == rid))
@@ -77,9 +80,9 @@ class PublicationService:
             .execution_options(populate_existing=True)
         )
         credential = db.scalar(
-            select(Credential).where(Credential.token_hash == digest(token)).with_for_update()
+            select(Credential).where(Credential.token_hash == token_hash).with_for_update()
         )
-        self.access.credential(db, digest(token))
+        self.access.credential(db, token_hash)
         if credential is None or credential.agent or credential.user_id != p.user_id:
             raise DomainError("forbidden", "Human maintainer permission is required")
         if (
@@ -92,9 +95,26 @@ class PublicationService:
         ):
             raise DomainError("not_found", "Repository unavailable", 404)
         member = db.get(Membership, (repo.workspace_id, p.user_id))
-        grants = tuple(
-            Grant(g.workspace_id, Role(g.role), g.repository_id)
-            for g in db.scalars(select(RoleAssignment).where(RoleAssignment.user_id == p.user_id))
+        from tacit_api.roles import effective_grants
+
+        # Re-read custom definitions and mapping existence under the same workspace
+        # lock. Team membership proof belongs to the authenticated principal; live
+        # audio refreshes it in its existing background loop, never once per chunk.
+        grants = effective_grants(
+            self.access,
+            db,
+            p.user_id,
+            {repo.workspace_id} if member and member.active else set(),
+            provider_token="",
+            organizations={repo.workspace_id}
+            if installation.owner_type == "Organization"
+            else set(),
+            repository_ids=p.github_repositories,
+            active_team_mappings=frozenset(
+                g.source_id
+                for g in p.grants
+                if g.source == "github_team" and g.source_id is not None
+            ),
         )
         fresh = Principal(
             p.user_id,
@@ -419,6 +439,10 @@ class PublicationService:
     def publish(
         self, p: Principal, rid: str, token: str, body: PublicationRequest
     ) -> PublicationResponse:
+        from tacit_api.quorum import Quorum
+
+        quorum = Quorum(self)
+        proofs = quorum.preflight(p, rid, body)
         request_digest = fingerprint(body.model_dump(mode="json"))
         with Session(self.engine) as db, db.begin():
             repo = self.write_repository(db, p, rid, token)
@@ -449,6 +473,7 @@ class PublicationService:
                     409,
                 )
             head = self.current(db, repo, body.expected_snapshot_id)
+            quorum.enforce(db, repo, p, view, proofs)
             revision_id, snapshot_id = str(uuid4()), str(uuid4())
             decision = Decision(
                 id=view.decision_id,

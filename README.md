@@ -429,7 +429,7 @@ Remaining user/external gates:
 - Human-authored 30-scenario evaluation with at least 10 held out, plus a bounded developer handoff study.
 - Production-shaped application recovery, deployed storage permissions, power-loss behavior and actual S3 acceptance if selected.
 
-Later implementation scope: team mappings/custom roles, editor selection integrations, multi-maintainer approval quorum and offline teaching synchronization. Snapshot export/lockfiles and opt-in remote MCP/OAuth are implemented as described below; live Codex remote OAuth discovery and pinned retrieval have passed; live revocation acceptance remains pending.
+Offline text teaching synchronization, two-account publication quorum and Arch VS Code selection have passed the operator-run checks recorded below. Native Windows/macOS acceptance and broader failure/deployment/quality gates remain separate. Team mappings/custom roles are implemented as described below; their two-account real-organization permission/revocation check has passed as recorded below. Snapshot export/lockfiles and opt-in remote MCP/OAuth are implemented as described below; live Codex remote OAuth discovery, pinned retrieval and server-side revocation have passed for the tested laptop/ngrok deployment.
 
 ## Laptop HTTPS test endpoint
 
@@ -623,9 +623,9 @@ Authorization requests expire in ten minutes; codes expire within two minutes an
 
 Grant records retain hashes of OAuth secrets and encrypted internal delegation, using the existing stable encryption key. Expired OAuth records are pruned when a new authorization begins. The access service retains its usual credential/audit lifecycle. Keep the database and encryption key in the existing private recovery process. A lockfile or snapshot export does not grant OAuth access.
 
-Local automated acceptance covers OAuth discovery and consent, all six tool reads against synthetic published knowledge, token audience separation, PKCE/redirect/state/resource checks, code replay, repository isolation, logout/GitHub/revocation/expiry, and an actual loopback Uvicorn connection using the MCP SDK client. These use fixture GitHub responses without paid providers. The operator subsequently completed the live Codex OAuth flow and supplied successful repository-scoped discovery and pinned retrieval output, recorded below. Live revocation remains a separate acceptance check. The implementation agent did not reconfigure the live deployment automatically.
+Local automated acceptance covers OAuth discovery and consent, all six tool reads against synthetic published knowledge, token audience separation, PKCE/redirect/state/resource checks, code replay, repository isolation, logout/GitHub/revocation/expiry, and an actual loopback Uvicorn connection using the MCP SDK client. These use fixture GitHub responses without paid providers. The operator subsequently completed the live Codex OAuth flow and supplied successful repository-scoped discovery and pinned retrieval output, recorded below. Server-side live revocation subsequently passed as recorded below. The original implementation did not automatically reconfigure the live deployment; the agent later restored the existing API/ngrok setup for the authorized revocation check.
 
-Automated verification on 2026-11-03: the full Python 3.14.8 project suite passed **684 tests, 30 skipped**, with the three existing Starlette deprecation warnings. The skips comprise six opt-in live Evon cases and 24 SQLite-only omissions whose PostgreSQL counterparts ran. A focused remote-MCP/CLI/compatibility/migration suite passed **160 tests, 2 skipped** on each of Python 3.12.15, 3.13.17 and 3.14.8; after the final public-client metadata adjustment, the complete remote MCP module was checked again on 3.12 (**82 passed, 2 skipped**). The new PostgreSQL-only cases exercise single-use code exchange and concurrent users with separate repository scopes. The socket test covers both an explicitly supplied OAuth token and automatic OAuth discovery/exchange with the official SDK client and fixture browser-consent handler. Live Codex OAuth read acceptance subsequently passed as recorded below; live revocation remains pending.
+Automated verification on 2026-11-03: the full Python 3.14.8 project suite passed **684 tests, 30 skipped**, with the three existing Starlette deprecation warnings. The skips comprise six opt-in live Evon cases and 24 SQLite-only omissions whose PostgreSQL counterparts ran. A focused remote-MCP/CLI/compatibility/migration suite passed **160 tests, 2 skipped** on each of Python 3.12.15, 3.13.17 and 3.14.8; after the final public-client metadata adjustment, the complete remote MCP module was checked again on 3.12 (**82 passed, 2 skipped**). The new PostgreSQL-only cases exercise single-use code exchange and concurrent users with separate repository scopes. The socket test covers both an explicitly supplied OAuth token and automatic OAuth discovery/exchange with the official SDK client and fixture browser-consent handler. Live Codex OAuth read acceptance subsequently passed as recorded below; server-side live revocation subsequently passed as recorded below.
 
 Ruff, formatting, strict mypy (53 source modules), frozen-lock consistency, JavaScript syntax, diff checks, and API/MCP wheel and source builds passed. Only README was updated among Markdown source documents, and the AST code graph was refreshed. Logs and built artifacts are local in `/tmp/tacit-remote-mcp-regression/`. Automated tests used a separate disposable PostgreSQL container; that test run did not migrate or reconfigure the running application database or deployment. The operator subsequently enabled the live deployment for the acceptance check below.
 
@@ -640,6 +640,276 @@ The operator completed the Codex remote OAuth setup against `https://zodiac-bubb
 - The returned route-hint restriction, distance/equality thresholds, ambiguity requirements and vehicle/direction limits matched the published statement. Its source-derived qualification was preserved. `answer_kind: none` represents retrieved statements, not provider synthesis.
 - All reported reasoning, STT, TTS and input/output token counters were zero. The operator reported no modification or publication.
 
-**Remaining for remote MCP acceptance:** revoke this live connection and verify that subsequent reads fail. Automated revocation, expiry, logout, audience separation and concurrent-user isolation checks have passed; this successful live read does not independently establish those live negative paths. Live remote OAuth acceptance is therefore partial, not complete.
+**Remote MCP live acceptance:** complete for the tested Codex/laptop/ngrok setup after the server-side revocation check below. Automated expiry, logout, audience separation and concurrent-user isolation checks remain distinct from live operator evidence; this acceptance does not claim every client, native platform or production deployment was tested.
 
-**Next implementation:** GitHub team-to-role mappings and custom roles. Editor source selection, multi-maintainer approval quorum and offline teaching synchronization remain later implementation work. Native platform and other external acceptance gates above remain separate; this update does not mark the entire project finished.
+**Subsequent implementation:** GitHub team-to-role mappings and custom roles were implemented next; see their section below. Editor source selection was implemented next as described below; multi-maintainer approval quorum is implemented below, while offline teaching synchronization remains later implementation work. Native platform and other external acceptance gates above remain separate; this update does not mark the entire project finished.
+
+
+### Live remote OAuth revocation — 2026-11-03
+
+The agent restored the existing local API and ngrok processes using the existing database, stable encryption key, public origin and registered Codex callback. No configuration file or database schema was changed for this check. The previous remote token had expired, so the operator completed a fresh Codex/GitHub login and selected only Raahi. The agent then performed the following check directly through the public HTTPS endpoint using that saved `tacit-remote` OAuth credential:
+
+| Check | Observed result |
+|---|---|
+| Pinned Raahi `get_context` before revocation | HTTP 200; exact snapshot/revision, confirmed applicability, complete retrieval and zero provider usage |
+| `POST /revoke` with client ID `tacit-codex` | HTTP 200 |
+| First identical-context read with the same token | HTTP 401 with OAuth protected-resource challenge |
+| Second identical-context read with the same token | HTTP 401 with OAuth protected-resource challenge |
+
+The token's recorded expiry was still in the future after the failures, distinguishing revocation from expiry. The check used raw HTTP with no automatic OAuth refresh or sign-in. No credential was printed or saved in the receipt, and no repository knowledge was modified or published. The separate CLI login was not changed. Safe local evidence: `output/remote-mcp-revocation/result-20261103T040208Z.json`; the local helper is `output/remote-mcp-revocation/check.py`. These local artifacts are not part of the committed source.
+
+Mark the **live remote MCP/OAuth read-and-revocation acceptance complete for this tested setup**. The tested Codex connection is intentionally left revoked; authenticate `tacit-remote` again before using it. The restored API and ngrok remain running for further work. GitHub team-to-role mappings and custom roles were the next task and are now implemented below; the other external acceptance gates remain unchanged.
+
+## GitHub team mappings and custom roles
+
+Workspace administrators can define named content roles and map GitHub organization teams to repository-scoped or workspace-wide content roles. These are additive grants: removing a team grant does not remove a separate direct grant. Current GitHub repository visibility, active membership, enabled installation/repository state, and delegated-token scope remain mandatory. Agents remain read-only even when their human's custom/team role resolves to maintainer.
+
+Custom roles support two explicit permissions:
+
+| Permission | Capability |
+|---|---|
+| `knowledge.read` | Read confirmed knowledge/history, ask questions and evaluate scenarios |
+| `knowledge.write` | Human maintainer capabilities, including teaching, voice, correction, draft review and publication; requires `knowledge.read` |
+
+Custom roles do not grant workspace administration. Team mappings can target the built-in `learner` or `maintainer` content role, or one custom role. Built-in administrator assignment and last-administrator protection are unchanged. Existing learners keep their baseline read access unless that separate grant is explicitly revoked; a team mapping cannot act as a deny rule. A user granted `knowledge.write` is explicitly granted maintainer-equivalent content authority, while an administrator-only role still cannot publish knowledge.
+
+Apply migration `0008` before restarting the API/worker with this code. No existing built-in role assignments are rewritten. The following example uses the existing test organization/repository; run it only as a human workspace administrator after creating the intended team in GitHub:
+
+```bash
+cd /home/vansh/Tacit
+uv run --env-file .env --no-sync alembic upgrade head
+# Restart the API/worker with the normal deployment configuration before continuing.
+
+export TACIT_API_URL=https://zodiac-bubbling-stereo.ngrok-free.dev
+TACIT_WORKSPACE=gh-343680840
+TACIT_REPOSITORY=gh-1422572999
+
+# Human sign-in, if the current CLI credential has expired.
+uv run --no-sync tacit login
+
+# Create a named maintainer-equivalent content role.
+uv run --no-sync tacit custom-roles put reviewers \
+  --workspace "$TACIT_WORKSPACE" \
+  --permission knowledge.read --permission knowledge.write \
+  --expected-version 0 --description "Human repository knowledge maintainers"
+
+# Map an existing GitHub team whose slug is knowledge-maintainers.
+uv run --no-sync tacit team-roles add knowledge-maintainers \
+  --workspace "$TACIT_WORKSPACE" --custom-role reviewers \
+  --repo "$TACIT_REPOSITORY"
+
+uv run --no-sync tacit custom-roles list --workspace "$TACIT_WORKSPACE"
+uv run --no-sync tacit custom-roles assignments --workspace "$TACIT_WORKSPACE"
+uv run --no-sync tacit team-roles list --workspace "$TACIT_WORKSPACE"
+uv run --no-sync tacit team-roles effective --workspace "$TACIT_WORKSPACE"
+```
+
+Individual custom-role assignment uses `tacit custom-roles grant USER_ID ROLE_ID --workspace WORKSPACE_ID --repo REPOSITORY_ID`; `custom-roles revoke` uses the same arguments. Omitting `--repo` makes an assignment or mapping workspace-wide, still restricted to currently accessible enabled repositories. `team-roles add --role learner` or `--role maintainer` targets a built-in content role instead of `--custom-role`. Remove a mapping with `team-roles remove MAPPING_ID --workspace WORKSPACE_ID`, using the ID from `team-roles list`.
+
+Role edits require the current `--expected-version`; creation requires zero. Stale edits/deletes return a conflict. A role in use cannot be deleted until its assignments and mappings are removed. `custom-roles delete ROLE_ID --workspace WORKSPACE_ID --expected-version VERSION` retires that ID permanently, preventing delayed requests from affecting a recreated role. Active roles are limited to 100, individual custom assignments to 1,000 and team mappings to 20 per workspace. Effective authentication bounds distinct team checks to 64 across its eligible scopes and fails closed if that budget is exceeded.
+
+GitHub team creation and membership changes remain GitHub operations; Tacit never modifies them. The GitHub App needs organization **Members: read** permission. Mapping creation resolves the selected team slug to its numeric team ID and validates its organization ID. Runtime checks use the numeric organization/team membership endpoint and the authenticated user's freshly verified login/ID, preserving identity across renames and preventing a recreated slug from inheriting an old mapping. Only active membership grants a role; pending/absent memberships do not. Each distinct mapped team is checked once per principal evaluation, without a cross-request team-membership cache. A membership verification error fails content authorization closed; built-in administrator policy-management routes can still remove a broken mapping without requiring that team's API, while retaining ordinary GitHub eligibility and local administrator checks.
+
+Publication and other local write checks reload custom permissions and mapping existence under the workspace lock. Mapping removal and permission downgrades therefore stop stale local grants. External team membership is refreshed on HTTP authentication, within the existing live-audio background refresh interval/deadline, and at the durable-upload reauthentication interval. Local audio checks do not make a GitHub team request per chunk. These transport windows are distinct from immediate local policy revocation. Configuration changes are audited; derived team grants are never copied into permanent individual role rows.
+
+The administrative API adds `/v1/workspaces/{wid}/custom-roles`, `/custom-role-assignments` and `/team-role-mappings`, with scoped update/revoke/delete routes. `/effective-access` reports the authenticated user's current normalized grants and source provenance. MCP continues to expose exactly six read-only tools; no policy-management tool was added. Existing role and membership commands remain supported.
+
+Implementation and automated verification are described below. Live team enrollment/removal was a separate operator acceptance gate and subsequently passed as recorded below. No live organization policy, membership, repository permissions or database schema was changed during automated development; migration and temporary Tacit policy changes were performed later during the authorized live check.
+
+Automated verification on 2026-11-03 passed the full Python 3.14.8 regression suite: **753 passed, 32 skipped**, with the three existing Starlette deprecation warnings. After adding the final administrator-budget recovery cases, the focused team/custom-role and migration suite passed **73 tests, 2 skipped** on each of Python 3.12.15, 3.13.17 and 3.14.8. The two focused skips are SQLite concurrency/socket cases whose PostgreSQL counterparts ran; the full-suite skips also include the six opt-in live Evon cases. The full run collected 785 cases before the final two feature cases were added; this distinction explains the subsequent collection-count increase.
+
+Coverage includes human custom-role teaching/publication, read-only custom roles without a built-in content grant, agent write refusal, tenant/repository isolation, stale versions and retired role IDs, pending/removed/recreated teams, rename-safe numeric identity, malformed/provider-failure handling, direct-grant preservation, one membership lookup per distinct team, last-administrator protection, concurrent policy updates and duplicate mapping requests, stale-principal rejection, revocation during an open durable voice upload, safe cleanup after suspension/repository disablement, and administrator recovery from broken or over-budget mappings. CLI commands and composite database constraints are exercised. These are fixtures and local PostgreSQL/socket checks, not a live GitHub team demonstration.
+
+Ruff, formatting, strict mypy (55 source modules), frozen-lock consistency, diff checks, and API/CLI/contracts/domain wheel and source builds passed. The wheels include the new role modules, and the code graph was refreshed. Logs and JUnit reports are local in `/tmp/tacit-team-role-regression/`; a safe source-hash/result receipt is retained in `output/team-role-check/results.json`. The disposable PostgreSQL test container was removed. At the end of automated development, migration `0008` had not yet been applied to the real application database and no live GitHub team or role policy had been changed. Live acceptance preparation subsequently applied the migration, as recorded below; the two-account live permission/revocation check subsequently passed as recorded below. Changes remain uncommitted; only README was edited among Markdown source documents during this implementation.
+
+
+### Live team-role acceptance preparation — 2026-11-03
+
+A private compressed backup of the running application database was created and its archive listing validated before migration (1,358,841 bytes). Migration `0008` was then applied and the API restarted with the existing stable encryption key and public MCP configuration. Hash comparison confirmed the five published snapshots, five revisions, three repository heads and seven existing direct role assignments were unchanged. The backup and safe migration receipt remain local under `output/team-role-live/`; they are not source artifacts to commit.
+
+Preflight confirmed that `vanshjj` is an active organization member with only the learner content grant, and that the organization already gives members read access to repositories. This allows a team-write revocation check to preserve independent repository read access. No existing role grant is to be removed for the test. The available GitHub CLI credential has read-only organization scope, so the operator must create the disposable `tacit-role-check` team and manage its test membership through GitHub. The Tacit CLI credential also needs a fresh human login.
+
+At preparation time, live team/custom-role behavior was not yet accepted. The prepared two-account check was designed to verify learner denial, a team-mapped custom writer grant, an explicit permission downgrade, local mapping removal, agent write/admin refusal, cross-workspace denial, and GitHub team-membership removal while retaining repository read access. Teaching probes deliberately use invalid bodies to distinguish permission denial (403) from authorized request validation (422); no draft or knowledge was to be created or published. This positive permission probe does not constitute a live publication test. Temporary mappings and role authority were to be removed afterward, preserving existing direct grants and the published head. The completed results follow.
+
+
+### Live team/custom-role permission acceptance — 2026-11-03
+
+The two-account check passed against the ngrok-backed deployment using administrator `nexxucc` (`gh-149251890`) and learner `vanshjj` (`gh-139905374`) in `tacit-voice-logging`. The operator created GitHub team `tacit-role-check` (numeric ID `20479644`), added the learner and selected Read access only to `scheduler-demo`. Tacit configuration was tested only for repository `gh-1422572999`.
+
+| Check | Observed result |
+|---|---|
+| Learner before mapping | Effective maintainer authority absent; teaching probe HTTP 403; pinned read HTTP 200 |
+| Team mapped to the custom read/write role | Effective maintainer authority present; invalid teaching probe HTTP 422; pinned read HTTP 200 |
+| Custom role downgraded to read only | Teaching probe HTTP 403; repository read retained |
+| Custom write permission restored | Effective maintainer authority restored; invalid teaching probe HTTP 422 |
+| Local mapping removed while GitHub membership remained active | Teaching probe HTTP 403 |
+| Scoped agent acting for the promoted learner | Teaching and policy-administration requests both HTTP 403 |
+| Mapping attempted with another workspace's repository | HTTP 404 |
+| Operator removed learner from the GitHub team, keeping organization membership | GitHub team membership HTTP 404; effective maintainer authority absent; teaching probe HTTP 403; pinned read HTTP 200 |
+
+All context reads used snapshot `ff964f49-8174-4280-874a-4e27876a213b` and reported zero provider/token usage. The positive teaching probes deliberately supplied invalid bodies, so HTTP 422 establishes passage through the maintainer permission gate alongside the effective-grant result; it does **not** establish live draft creation or publication. No knowledge was created, modified or published by this check.
+
+Cleanup removed both temporary mappings, retired custom role `live-reviewers-20261103054355`, revoked the temporary learner/agent credentials, and restored the owner CLI login. Cleanup reported no errors. Independent database hash comparison confirmed that all published snapshots, revisions, heads and seven pre-existing direct role assignments were unchanged. The operator-created GitHub test team remains available, with the learner removed and no Tacit mapping. Private backup and safe receipts remain local under `output/team-role-live/`, including `result.json`; do not commit these operational artifacts.
+
+Mark the **two-account live team/custom-role permission and revocation acceptance passed for this setup**. Real custom-role publication remains covered by fixture tests rather than this live permission probe. The four-user demonstration and other native-platform/provider/production acceptance gates remain separate. Editor source-file/symbol selection is implemented below. Approval quorum is implemented below. Offline teaching synchronization remains the next implementation task.
+
+
+### Editor source selections — 2026-11-03
+
+The local VS Code adapter in `editors/vscode/` exports the active file, one contiguous selection, or a symbol supplied by the editor's language provider. It discovers the active file's Git checkout independently of workspace-folder order, prompts for a full source commit, and delegates validation/private-file creation to the installed Tacit CLI. No API credential, upload, microphone capture, model request or publication is involved in exporting context.
+
+Build and install the local extension (Python standard library only; no npm dependencies):
+
+```bash
+cd /home/vansh/Tacit
+mkdir -p output/editor
+uv run --no-sync python scripts/package_editor.py output/editor/tacit-source-selection.vsix
+code --install-extension output/editor/tacit-source-selection.vsix
+```
+
+The packager refuses to replace an existing archive. For a rebuild choose a fresh output filename. This is a local development extension, not a Marketplace release. In VS Code user settings, set `tacit.cliPath` to the installed executable, for example `/home/vansh/Tacit/.venv/bin/tacit` on this Arch checkout. The value is an executable path, not `uv run tacit` or another shell command. On Windows use the installed `tacit.exe` path. Workspace Trust is required; virtual documents and unsaved buffers are rejected. In remote VS Code sessions the executable and files must exist on the extension's workspace host.
+
+Open a saved UTF-8 source file, then choose **Tacit: Export Active File Context**, **Tacit: Export Selected Lines Context**, or **Tacit: Export Symbol Context** from the command palette. The symbol picker requires a document-symbol provider for that language. Use a pushed, full 40-character SHA and save the exported JSON to a private local location outside version control. The adapter does not prove a commit has been pushed; the existing teaching API checks authoritative GitHub source access. Files are limited to 64 KiB and selections to 400 lines. Large files require a separate workflow; selecting fewer lines does not bypass the 64 KiB file limit.
+
+The equivalent editor-independent command is:
+
+```bash
+tacit editor capture --root /path/to/checkout --commit FULL_40_CHARACTER_SHA \
+  --file app/matcher.py --start-line 10 --end-line 35 --symbol match_route \
+  --output /private/path/editor-context.json
+```
+
+Use the versioned export with grounded teaching, supplying the same commit and file scope:
+
+```bash
+tacit teaching extract --repo REPOSITORY_ID --commit FULL_40_CHARACTER_SHA \
+  --file app/matcher.py --source-root /path/to/checkout \
+  --editor-context /private/path/editor-context.json --text-file /private/path/intent.txt
+```
+
+`--editor-context` requires `--source-root` and cannot be combined with `--selections-file`. Import checks the exact commit, file scope, current disk hashes and dirty-file evidence before requesting the API. Re-export if the source changes. The existing human confirmation still controls extraction, followed by the existing clarification/review/draft/confirm workflow for publication. The JSON is local selection metadata, not a signed assertion or proof of symbol semantics. Dirty hashes identify local differences; local bytes and symbol names never replace verified commit content. Review line ranges against the pinned commit when the working file differs. The legacy `--selections-file` format remains available.
+
+Verification: 16 focused Python tests passed; 12 Node adapter tests passed, including real CLI export; the VSIX installed and appeared in an isolated VS Code extension inventory. Tests cover source changes, commit/file mismatch, dirty hashes, escaped symlinks, root selection, bounds, exclusive output creation, shell-argument safety, symbol/range conversion, cancelled dialogs, untrusted workspaces and unsaved/external edits. A broader relevant Python regression run passed 122 tests with 48 conditional skips (PostgreSQL-only variants were not enabled for this focused run) and one existing Starlette warning. Ruff, formatting, strict mypy and diff checks passed; the AST graph was refreshed. The operator subsequently confirmed all three VS Code commands and the unsaved-edit, saved-dirty-file, overwrite, empty-selection and cancellation checks on Arch. The older-context import also returned the expected changed-file rejection. This marks the supplied Arch editor manual acceptance passed; native Windows/macOS checks remain pending. No paid provider request or knowledge publication was used. Run `uv run --no-sync pytest tests/test_editor_context.py` and `node --test editors/vscode/extension.test.js` to repeat these checks (the real CLI Node test uses this checkout's `.venv/bin/tacit` on Arch).
+
+
+### Multi-maintainer publication quorum — 2026-11-03
+
+Repositories may require one to five distinct current human maintainers for publication. The default is **one**, preserving ordinary human confirmation. The final confirmer counts once; other counted people must have explicitly approved that exact draft. The author may participate, but repeated approval, multiple credentials for the same person, and approving one's own draft do not create additional people. Workspace administration alone grants neither approval nor publication permission. Maintainer-equivalent custom/team roles are eligible; agents cannot approve, withdraw approvals or publish.
+
+Publication policy is repository-scoped and managed only by explicit human workspace administrators. Updates require the current policy version. Every update, including a change back to an earlier threshold, increments the version and invalidates previous approvals for future publications. An administrator can explicitly lower the threshold; this is audited policy administration, not a restriction that requires the existing publication quorum. Published snapshots remain immutable.
+
+An approval binds a human ID and the approving human credential's hash to the immutable draft digest, its bound base snapshot and the policy version. No raw credential is stored in the approval or exposed in status responses. Current GitHub eligibility, repository access, team membership and normalized content authority are rechecked before publication; credential expiry/revocation, local permissions, mapping existence and current policy are checked again under the shared publication workspace lock. Approval withdrawal and policy/permission changes serialize with publication. External-provider verification precedes the lock; external changes that occur after that verification are subject to the same unavoidable observation window as ordinary GitHub-backed publication.
+
+A non-confirmer approval remains bound to its approving credential. If that credential expires or is revoked, that person must sign in and approve again. Approval status lists **recorded** reviews, not a promise that quorum is currently satisfied. Read-only knowledge queries and the six MCP tools do not expose approval or publication actions. Up to twenty distinct recorded reviewers are allowed per draft; if stale reviews exhaust that bound, prepare and review a new draft. Fresh eligibility checks stop once enough additional eligible reviewers have been found; the final locked check may still require a retry if local authority changes meanwhile.
+
+API endpoints:
+
+- `GET/PUT /v1/repos/{repository_id}/publication-policy`: human administrator policy inspection/update, with `required_maintainers` and `expected_version` on PUT.
+- `GET/POST/DELETE /v1/repos/{repository_id}/teaching-sessions/{draft_id}/approvals`: maintainer inspection, exact-review approval, or withdrawal of the caller's own approval. POST includes `policy_version`, `review_digest` and `expected_snapshot_id`.
+- Existing `POST .../publications` still requires explicit human confirmation, matching draft/base and a unique confirmation operation ID. Insufficient current approvals return HTTP 409 `quorum_required` without changing knowledge. Receipt retries preserve the original result; approval checks do not republish a draft.
+
+Migration `0009` adds `publication_policies` and `draft_approvals` with composite repository/draft foreign keys, user/credential foreign keys and policy bounds. Apply it with writers stopped and a verified private backup before starting this API against an existing database. This development task tests migrations in disposable databases; it does not migrate the running working deployment automatically. Do not downgrade away approval tables in a production deployment as a way to bypass quorum.
+
+Human-operated CLI flow after migration and API restart (replace the placeholders with a disposable test repository and reviewed draft):
+
+```bash
+# Human administrator: inspect policy; an unconfigured repository reports version 0.
+uv run --no-sync tacit approvals policy --repo REPOSITORY_ID
+uv run --no-sync tacit approvals set-policy --repo REPOSITORY_ID \
+  --required 2 --expected-version 0
+
+# First human maintainer creates a source-bound draft using the existing teach workflow.
+# A different human maintainer reviews and explicitly approves that draft under their own login.
+uv run --no-sync tacit review DRAFT_ID --repo REPOSITORY_ID
+uv run --no-sync tacit approvals approve DRAFT_ID --repo REPOSITORY_ID
+uv run --no-sync tacit approvals list DRAFT_ID --repo REPOSITORY_ID
+
+# A different current human maintainer confirms; their confirmation supplies the second person.
+uv run --no-sync tacit confirm DRAFT_ID --repo REPOSITORY_ID
+
+# Before publication, a reviewer may withdraw their own approval.
+uv run --no-sync tacit approvals withdraw DRAFT_ID --repo REPOSITORY_ID
+```
+
+Review and approve under each person's own human login. Do not use an agent token to impersonate a maintainer or publish test narration to a real project's knowledge. Approval itself does not publish and does not invoke Evon, Prisma or Timbre. The confirmer CLI allows a longer request timeout for fresh reviewer verification. A failed/uncertain confirmation should reuse its printed operation ID, as before.
+
+Verification: full Python 3.14.8 regression with disposable PostgreSQL 17 passed **816 tests, 33 skipped, zero failures/errors** (849 collected, 330.87 seconds), with three pre-existing Starlette deprecation warnings. Twenty-seven skips are SQLite variants whose PostgreSQL counterparts ran; six require explicit live Evon configuration. Final quorum/migration checks passed **47 tests with one SQLite concurrency skip** on each of Python 3.12.15, 3.13.17 and 3.14.8. These include distinct-human counting, repeated self-approval, exact content/base/policy bindings, withdrawal, credential expiry/revocation, current GitHub access, custom-role downgrades, provider failure, races between preflight and local commit, three-person quorum, CLI confirmation, at-most-once concurrent publication, receipt retries and migration roundtrip. The final focused checks cover the last fresh-reviewer short-circuit optimization after the full regression run began.
+
+Ruff, formatting, strict mypy (58 source modules), lockfile consistency and diff checks passed. CLI/API/contracts wheels and source distributions built successfully. The AST graph was refreshed. Private/local safe receipts are under `output/quorum-check/`; detailed full regression logs/JUnit are under `/tmp/tacit-quorum-regression.RlEBpH/`. The dedicated test PostgreSQL container was removed after verification; the working database was neither migrated nor otherwise modified for this task. No live GitHub/Gnani/Evon calls, real knowledge publication, commit or push were performed. Live two-account publication/quorum acceptance remains pending; the earlier team-role permission demonstration is separate. Offline teaching synchronization remains unimplemented.
+
+
+### Live two-account quorum acceptance — 2026-11-03
+
+The operator completed the synthetic `scheduler-demo` quorum check as `nexxucc` and `vanshjj`. After a verified private backup, migration `0009` was applied to the working development database and the API restarted. Existing knowledge and direct-role counts were preserved during migration. The operator enabled a two-person policy (version 1), temporarily granted `vanshjj` repository-only maintainer access and created draft `732a53c2-fa3a-4efc-8379-ed054e5f1ed2` with digest `62cb0fdfb9183e61be764104aa67aa915d000fbed377bd67f6e64d3abf68b059`.
+
+The operator's first confirmation as `nexxucc` returned `quorum_required` HTTP 409. `vanshjj` then reviewed and explicitly approved that exact digest under their own human login. Confirmation as `nexxucc` succeeded, creating revision `83360472-4026-4c06-8d81-dfc1015ed1f3` and snapshot `2bc3302e-68c6-4d3e-a84a-fdd012c558f7`, parent `ff964f49-8174-4280-874a-4e27876a213b`. Independent database checks verified the new head and quorum audit containing both distinct human IDs (`gh-139905374`, `gh-149251890`), required count 2, policy version 1 and the exact draft digest.
+
+Cleanup removed the temporary repository maintainer grant and restored a one-person publication policy at version 2. The synthetic acceptance record remains published in the demo repository; existing snapshots remain immutable. No Raahi knowledge was changed. Private backup and safe acceptance receipt are local under `output/quorum-live/`; do not commit them. Mark the tested two-person live publication flow passed. Live approval withdrawal, permission revocation between approval and confirmation, and larger quorums remain fixture-tested rather than operator-tested. Offline teaching synchronization remains the next implementation task.
+
+
+### Offline text teaching synchronization — 2026-11-03
+
+`tacit offline` provides an opt-in private queue for text teaching intent. Preparation, listing, inspection, rebasing and forgetting work without API access or credentials. Preparation requires an explicit human author ID, a trusted configured API URL, a local Git commit and file scope, and a pinned base snapshot (via `--lock` or `--expected-snapshot`; use `none` only for an empty head). This claimed author is checked against the actual authenticated human at synchronization; it grants no permission by itself.
+
+The queue stores reviewed text, optional typed rules/decision replacement, source hashes and local dirty-selection metadata. It does not store credentials or committed source bytes, perform background uploads, call a model/speech service, or publish knowledge. Dirty local source never replaces the source fetched from the pinned Git commit by the API. Saved-audio upload and transcription remain in the existing explicit voice workflow; this queue does not queue raw audio, preserve voice-correction lineage, perform offline Evon extraction or merge distributed edits.
+
+Example using a previously generated lock for Raahi; replace paths and intent with what the human maintainer has reviewed:
+
+```bash
+cd /home/vansh/Tacit
+export TACIT_API_URL=https://zodiac-bubbling-stereo.ngrok-free.dev
+
+# Works while the API/network is unavailable; no login or keyring access is needed.
+uv run --no-sync tacit offline prepare \
+  --repo gh-1406716088 --author gh-149251890 \
+  --commit 2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd \
+  --file app/matcher.py --source-root /path/to/raahi-checkout \
+  --lock tacit.lock.json --text-file /private/path/reviewed-intent.txt
+
+uv run --no-sync tacit offline list
+uv run --no-sync tacit offline show ENTRY_ID
+
+# Once online, sign in as that human, review the displayed queue entry, then consent.
+uv run --no-sync tacit whoami
+uv run --no-sync tacit offline sync ENTRY_ID --source-root /path/to/raahi-checkout
+
+# Synchronization returns a private draft; publication is a separate human workflow.
+uv run --no-sync tacit review DRAFT_ID --repo gh-1406716088
+uv run --no-sync tacit confirm DRAFT_ID --repo gh-1406716088
+```
+
+The existing repository maintainer permissions and configured publication quorum still apply. Offline sync itself invokes neither `confirm` nor approval endpoints. All six MCP tools remain read-only. Preparation does not verify GitHub access or prove the commit is pushed; authenticated API draft creation does that online. A lock is a scope/base pin, not authorization or a signed source of truth.
+
+Before the first upload, sync checks the selected server, current source hashes, actual human identity and current knowledge head. Changed source is refused; inspect intent and prepare a new entry if necessary. A changed head is refused without silently overwriting newer knowledge. After reviewing intent against the new snapshot, explicitly change an **unattempted** queue entry's base:
+
+```bash
+uv run --no-sync tacit offline rebase ENTRY_ID --expected-snapshot NEW_SNAPSHOT_ID
+# Rebase asks for confirmation and assigns a fresh draft operation ID.
+uv run --no-sync tacit offline sync ENTRY_ID --source-root /path/to/raahi-checkout
+```
+
+Sync durably records `attempted` before sending a draft request. If the connection or local acknowledgement fails, retry the same entry: the operation ID, request and base remain fixed, allowing server idempotency to recover a draft that may already exist. Recovery deliberately does not require unchanged local source or an unchanged current head; it replays the original pinned request, never current working bytes. Only a definitive `snapshot_conflict` HTTP 409 resets an attempted entry to unattempted, because that response means no draft was committed for the operation. Other uncertain/rejected attempts remain immutable and must be investigated/recovered before any new teaching attempt. Do not repeatedly create new entries to work around an uncertain result.
+
+Successful sync saves the returned draft locally as `synced`; repeating it displays that saved result without contacting the API. This local copy does not prove current access, current publication status or later revocation. Use online review for current status. Never treat queue JSON as authenticated or portable authority.
+
+The default queue is the `offline-teaching` sibling of the native voice spool directory. `TACIT_OFFLINE_QUEUE` selects an explicit private local directory. Files are private JSON with native ACL/permission handling; they are not encrypted by Tacit. Retention is explicit, with at most twenty entries and 128 KiB per entry; no age-based deletion runs. Intent is limited to 8,000 characters and local/committed source files to the existing 64 KiB capture bound. Exclusive OS locking serializes queue writers and sync/rebase/delete operations, so other queue operations wait while a sync or its consent prompt holds that lock. Atomic replace and durable acknowledgement reuse the audio spool's platform storage implementation. Never store this queue in version control.
+
+```bash
+uv run --no-sync tacit offline forget ENTRY_ID
+```
+
+Forgetting asks for confirmation and deletes only local data. It cannot retract a draft or immutable publication already created on the server. If deleting an uncertain attempt, preserve its operation ID privately before investigating the server outcome. No server migration is required for this CLI-only feature. Native Windows/macOS queue behavior and operator-run online/offline acceptance remain separate from fixtures.
+
+
+Offline verification: full Python 3.14.8 regression with disposable PostgreSQL passed **830 tests, 33 skipped, zero failures/errors** (863 collected, 299.35 seconds), with three existing Starlette deprecation warnings. Twenty-seven skips were SQLite variants whose PostgreSQL counterparts ran; six require live Evon configuration. After adding the final disk-failure/capacity/corruption guards and tests, the focused offline/source/audio/snapshot regression passed **128 tests with one SQLite locking skip**. Final offline-specific tests passed **21 tests** on each supported Python version (3.12.15, 3.13.17, 3.14.8); these are repeated interpreter checks rather than independent scenarios.
+
+Coverage includes offline preparation without an HTTP client, explicit consent, account/agent/server mismatch, changed source/head, explicit rebase, immutable attempted-request digests, lost API responses, failure to persist attempt/acknowledgement, mismatched API output, exclusive queue capacity under competing processes, UUID collisions, corrupted-state refusal and explicit local deletion, escaped paths/symlinks, lock scope, source bounds and recovery against the actual draft API with fixture GitHub responses. Database inspection in those API tests confirms exactly one draft and no snapshot/publication receipt after retries.
+
+Ruff, formatting, strict mypy (59 source modules), lockfile consistency, diff checks, CLI wheel/source build and AST graph refresh passed. Detailed logs/JUnit remain at `/tmp/tacit-offline-regression.VZsXOS/`; safe local receipt is `output/offline-check/results.json`. The disposable test database was removed. No working-database migration, real knowledge upload/publication, live provider call, commit or push occurred. The remaining acceptance is a human-operated offline-to-online text queue run and native Windows/macOS storage/terminal checks. Existing saved-audio recovery remains a separate workflow.
+
+
+### Operator offline-to-online text queue acceptance — 2026-11-03
+
+The operator reported successful disconnected preparation of queue entry `50f0abf6-bf86-43e4-8bcb-bbe240c09c02`, operation `3fe07556-ac7c-4d43-998c-840dbf416774`, for synthetic scheduler-demo text. Online sync returned private draft `a058faa2-3d07-47ec-9ff0-4e0e941d7ed4` with matching statement, source commit and base snapshot. Repeating sync while disconnected returned the same saved draft and the local list reported `synced`.
+
+Independent read-only checks confirmed exactly one server draft for that author/repository/operation, no publication receipt for it, the synced local receipt, and unchanged repository head `2bc3302e-68c6-4d3e-a84a-fdd012c558f7`. The disconnect and terminal interactions are operator-reported; no independent network capture was taken. Mark this basic offline-to-online text flow and disconnected cached-result replay passed. Real interrupted in-flight upload/acknowledgement recovery, head conflicts, identity switching and native Windows/macOS queue behavior remain fixture-tested or externally pending. No model/speech call or publication was needed. Safe receipt remains local at `output/offline-live/result.json`; the queue and synthetic server draft are retained rather than silently deleted.

@@ -46,10 +46,22 @@ def extract(
     text_file: Path | None = None,
     selections_file: Path | None = None,
     source_root: Path | None = None,
+    editor_context: Path | None = None,
     expected_snapshot: str | None = None,
     operation_id: str | None = None,
 ) -> None:
     try:
+        if editor_context and (selections_file or not source_root):
+            raise ValueError(
+                "Use --editor-context with --source-root and without --selections-file"
+            )
+        editor_selections = None
+        if editor_context:
+            from tacit_cli.editor import load_context
+
+            editor_selections = load_context(
+                editor_context, source_root or Path.cwd(), commit, files
+            )
         head = TypeAdapter(dict[str, str | None]).validate_python(
             request("GET", f"/v1/repos/{quote(repo, safe='')}/head")
         )
@@ -63,7 +75,9 @@ def extract(
             if selections_file
             else [{"path": path, "captured_at": datetime.now(UTC).isoformat()} for path in files]
         )
-        if source_root and not selections_file:
+        if editor_selections is not None:
+            selections = [selection.model_dump(mode="json") for selection in editor_selections]
+        elif source_root and not selections_file:
             from tacit_cli.source_context import capture
 
             selections = [

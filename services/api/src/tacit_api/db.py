@@ -448,3 +448,94 @@ class MCPGrant(Base):
     delegated_token: Mapped[str | None] = mapped_column(String(4096))
     credential_hash: Mapped[str | None] = mapped_column(ForeignKey("credentials.token_hash"))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CustomRole(Base):
+    __tablename__ = "custom_roles"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    description: Mapped[str] = mapped_column(String(512))
+    permissions: Mapped[list[str]] = mapped_column(JSON)
+    version: Mapped[int] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    __table_args__ = (CheckConstraint("version > 0", name="custom_role_version"),)
+
+
+class CustomRoleAssignment(Base):
+    __tablename__ = "custom_role_assignments"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(String(64))
+    user_id: Mapped[str] = mapped_column(String(64))
+    custom_role_id: Mapped[str] = mapped_column(String(64))
+    repository_id: Mapped[str | None] = mapped_column(String(64))
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "custom_role_id"], ["custom_roles.workspace_id", "custom_roles.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "user_id"], ["memberships.workspace_id", "memberships.user_id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class TeamRoleMapping(Base):
+    __tablename__ = "team_role_mappings"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    github_team_id: Mapped[str] = mapped_column(String(32))
+    team_slug: Mapped[str] = mapped_column(String(100))
+    role: Mapped[str | None] = mapped_column(String(32))
+    custom_role_id: Mapped[str | None] = mapped_column(String(64))
+    repository_id: Mapped[str | None] = mapped_column(String(64))
+    __table_args__ = (
+        CheckConstraint(
+            "(role IS NOT NULL AND custom_role_id IS NULL) OR (role IS NULL AND custom_role_id IS NOT NULL)",
+            name="team_one_role",
+        ),
+        CheckConstraint(
+            "role IS NULL OR role IN ('learner', 'maintainer')", name="team_content_roles_only"
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "custom_role_id"], ["custom_roles.workspace_id", "custom_roles.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+
+
+class PublicationPolicy(Base):
+    __tablename__ = "publication_policies"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    required_maintainers: Mapped[int] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+        CheckConstraint("required_maintainers BETWEEN 1 AND 5", name="quorum_size"),
+        CheckConstraint("version > 0", name="quorum_policy_version"),
+    )
+
+
+class DraftApproval(Base):
+    __tablename__ = "draft_approvals"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    draft_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    credential_hash: Mapped[str] = mapped_column(ForeignKey("credentials.token_hash"))
+    review_digest: Mapped[str] = mapped_column(String(64))
+    policy_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id", "draft_id"],
+            ["teaching_drafts.workspace_id", "teaching_drafts.repository_id", "teaching_drafts.id"],
+        ),
+        CheckConstraint("policy_version >= 0", name="approval_policy_version"),
+    )

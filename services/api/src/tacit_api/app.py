@@ -20,13 +20,17 @@ from tacit_contracts.models import (
     ClarificationAnswer,
     ContextRequest,
     ContextResponse,
+    CustomRoleGrantRequest,
+    CustomRoleRequest,
     DevicePoll,
+    DraftApprovalRequest,
     DraftRequest,
     DraftView,
     ErrorResponse,
     EvaluationResponse,
     InvitationRequest,
     PrepareDraft,
+    PublicationPolicyRequest,
     PublicationRequest,
     PublicationResponse,
     QuestionRequest,
@@ -35,6 +39,7 @@ from tacit_contracts.models import (
     SpeakRequest,
     TeachingRequest,
     TeachingView,
+    TeamRoleRequest,
     VoiceFinishRequest,
     VoiceRequest,
     VoiceSessionRequest,
@@ -68,6 +73,7 @@ from tacit_api.persistence import PostgreSQLStore
 from tacit_api.providers import SpeechToText
 from tacit_api.publication import PublicationService
 from tacit_api.reasoning import Evon
+from tacit_api.roles import RolePolicies
 from tacit_api.teaching import TeachingService
 from tacit_api.timbre import Timbre
 from tacit_api.voice import MAX_REQUEST_BYTES, Prisma, VoiceService
@@ -249,6 +255,24 @@ def create_app(
             read = request.method == "GET" or request.url.path.endswith(
                 ("/context", "/questions", "/evaluate")
             )
+            parts = request.url.path.split("/")
+            control_plane = (
+                len(parts) >= 5
+                and parts[1:3] == ["v1", "workspaces"]
+                and parts[4]
+                in {
+                    "custom-roles",
+                    "custom-role-assignments",
+                    "team-role-mappings",
+                    "members",
+                    "roles",
+                    "invitations",
+                }
+            )
+            # Only explicit built-in administrators can manage policy. Do not make
+            # removing a broken team mapping depend on that team's API succeeding.
+            if control_plane or request.url.path.endswith("/publication-policy"):
+                return access.principal(credentials.credentials, fresh=not read, team_grants=False)
             return access.principal(credentials.credentials, fresh=not read)
         if credentials is None or credentials.credentials not in tokens:
             raise DomainError("unauthenticated", "A valid Tacit credential is required", 401)
@@ -297,6 +321,10 @@ def create_app(
                 for model in (TeachingRun, ModelOperation, Artifact, PublicationIndex):
                     db.execute(select(model).limit(1))
                 db.execute(select(PublicationReceipt.operation_id).limit(1))
+                from tacit_api.db import CustomRole, CustomRoleAssignment, TeamRoleMapping
+
+                for policy_model in (CustomRole, CustomRoleAssignment, TeamRoleMapping):
+                    db.execute(select(policy_model).limit(1))
                 if remote_server is not None:
                     from tacit_api.db import MCPGrant
 
@@ -717,6 +745,52 @@ def create_app(
     def review(rid: str, draft_id: str, p: Principal = Depends(maintainer)) -> DraftView:
         return publications().review(p, rid, draft_id)
 
+    @app.get("/v1/repos/{rid}/publication-policy")
+    def publication_policy(rid: str, p: Principal = Depends(principal)) -> dict[str, object]:
+        from tacit_api.quorum import Quorum
+
+        return Quorum(publications()).policy_view(p, rid)
+
+    @app.put("/v1/repos/{rid}/publication-policy")
+    def set_publication_policy(
+        rid: str, body: PublicationPolicyRequest, p: Principal = Depends(principal)
+    ) -> dict[str, object]:
+        from tacit_api.quorum import Quorum
+
+        return Quorum(publications()).configure(p, rid, body)
+
+    @app.get("/v1/repos/{rid}/teaching-sessions/{draft_id}/approvals")
+    def draft_approvals(
+        rid: str, draft_id: str, p: Principal = Depends(maintainer)
+    ) -> dict[str, object]:
+        from tacit_api.quorum import Quorum
+
+        return Quorum(publications()).view(p, rid, draft_id)
+
+    @app.post("/v1/repos/{rid}/teaching-sessions/{draft_id}/approvals")
+    def approve_draft(
+        rid: str,
+        draft_id: str,
+        body: DraftApprovalRequest,
+        request: Request,
+        p: Principal = Depends(maintainer),
+    ) -> dict[str, object]:
+        from tacit_api.quorum import Quorum
+
+        return Quorum(publications()).approve(
+            p, rid, draft_id, request.headers["Authorization"].split(" ", 1)[1], body
+        )
+
+    @app.delete("/v1/repos/{rid}/teaching-sessions/{draft_id}/approvals")
+    def withdraw_approval(
+        rid: str, draft_id: str, request: Request, p: Principal = Depends(maintainer)
+    ) -> dict[str, object]:
+        from tacit_api.quorum import Quorum
+
+        return Quorum(publications()).withdraw(
+            p, rid, draft_id, request.headers["Authorization"].split(" ", 1)[1]
+        )
+
     @app.post("/v1/repos/{rid}/publications", response_model=PublicationResponse)
     def publish(
         rid: str,
@@ -783,6 +857,80 @@ def create_app(
     def revoke(wid: str, body: RoleChange, p: Principal = Depends(principal)) -> dict[str, str]:
         access_management().change_role(p, wid, body, True)
         return {"status": "revoked"}
+
+    @app.get("/v1/workspaces/{wid}/effective-access")
+    def effective_access(wid: str, p: Principal = Depends(principal)) -> dict[str, object]:
+        if wid not in p.memberships:
+            raise DomainError("not_found", "Workspace unavailable", 404)
+        return {
+            "workspace_id": wid,
+            "user_id": p.user_id,
+            "agent": p.agent,
+            "grants": [
+                {
+                    "role": g.role.value,
+                    "repository_id": g.repository_id,
+                    "source": g.source,
+                    "source_id": g.source_id,
+                }
+                for g in p.grants
+                if g.workspace_id == wid
+                and (g.repository_id is None or g.repository_id in p.github_repositories)
+            ],
+            "constraints": "Current GitHub access, local membership/repository state and token scope apply; agents cannot write.",
+        }
+
+    @app.get("/v1/workspaces/{wid}/custom-roles")
+    def custom_roles(wid: str, p: Principal = Depends(principal)) -> list[dict[str, object]]:
+        return RolePolicies(access_management()).list_roles(p, wid)
+
+    @app.put("/v1/workspaces/{wid}/custom-roles/{role_id}")
+    def put_custom_role(
+        wid: str, role_id: str, body: CustomRoleRequest, p: Principal = Depends(principal)
+    ) -> dict[str, object]:
+        return RolePolicies(access_management()).put_role(p, wid, role_id, body)
+
+    @app.delete("/v1/workspaces/{wid}/custom-roles/{role_id}")
+    def delete_custom_role(
+        wid: str, role_id: str, version: int = Query(ge=1), p: Principal = Depends(principal)
+    ) -> dict[str, str]:
+        RolePolicies(access_management()).delete_role(p, wid, role_id, version)
+        return {"status": "deleted"}
+
+    @app.get("/v1/workspaces/{wid}/custom-role-assignments")
+    def custom_assignments(wid: str, p: Principal = Depends(principal)) -> list[dict[str, object]]:
+        return RolePolicies(access_management()).list_assignments(p, wid)
+
+    @app.post("/v1/workspaces/{wid}/custom-role-assignments")
+    def grant_custom(
+        wid: str, body: CustomRoleGrantRequest, p: Principal = Depends(principal)
+    ) -> dict[str, str]:
+        RolePolicies(access_management()).assign(p, wid, body, False)
+        return {"status": "granted"}
+
+    @app.post("/v1/workspaces/{wid}/custom-role-assignments/revoke")
+    def revoke_custom(
+        wid: str, body: CustomRoleGrantRequest, p: Principal = Depends(principal)
+    ) -> dict[str, str]:
+        RolePolicies(access_management()).assign(p, wid, body, True)
+        return {"status": "revoked"}
+
+    @app.get("/v1/workspaces/{wid}/team-role-mappings")
+    def team_mappings(wid: str, p: Principal = Depends(principal)) -> list[dict[str, object]]:
+        return RolePolicies(access_management()).list_mappings(p, wid)
+
+    @app.post("/v1/workspaces/{wid}/team-role-mappings")
+    def map_team(
+        wid: str, request: Request, body: TeamRoleRequest, p: Principal = Depends(principal)
+    ) -> dict[str, object]:
+        return RolePolicies(access_management()).map_team(
+            p, wid, request.headers["Authorization"].split(" ", 1)[1], body
+        )
+
+    @app.delete("/v1/workspaces/{wid}/team-role-mappings/{mapping_id}")
+    def unmap_team(wid: str, mapping_id: str, p: Principal = Depends(principal)) -> dict[str, str]:
+        RolePolicies(access_management()).unmap(p, wid, mapping_id)
+        return {"status": "unmapped"}
 
     @app.post("/v1/workspaces/{wid}/invitations")
     def invite(

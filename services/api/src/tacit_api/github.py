@@ -6,11 +6,11 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, StrictInt, ValidationError
 from tacit_contracts.models import SourceBinding
 from tacit_domain.access import DomainError
 
@@ -56,6 +56,22 @@ class EligibleInstallation:
     repositories: tuple[GitHubRepository, ...]
     member: bool
     owner: bool
+
+
+class TeamOrganization(BaseModel):
+    id: StrictInt = Field(gt=0)
+    login: str = Field(min_length=1)
+
+
+class GitHubTeam(BaseModel):
+    id: StrictInt = Field(gt=0)
+    slug: str = Field(min_length=1, max_length=100)
+    organization: TeamOrganization
+
+
+class TeamMembership(BaseModel):
+    state: Literal["active", "pending"]
+    role: Literal["member", "maintainer"]
 
 
 class GitHub:
@@ -195,6 +211,35 @@ class GitHub:
                 "provider_unavailable", "Invalid GitHub access response", 503
             ) from None
         return tuple(result)
+
+    def team(self, token: str, organization: str, slug: str) -> GitHubTeam:
+        response = self.request(
+            "GET", f"/orgs/{quote(organization, safe='')}/teams/{quote(slug, safe='')}", token=token
+        )
+        if response.status_code == 404:
+            raise DomainError("not_found", "GitHub team unavailable", 404)
+        try:
+            return GitHubTeam.model_validate(response.json())
+        except (ValidationError, ValueError):
+            raise DomainError("provider_unavailable", "Invalid GitHub team response", 503) from None
+
+    def team_member(self, token: str, organization_id: str, team_id: str, login: str) -> bool:
+        # Numeric org/team identity survives renames and cannot adopt a recreated slug.
+        if not organization_id.isdecimal() or not team_id.isdecimal():
+            raise DomainError("provider_unavailable", "Invalid stored team identity", 503)
+        response = self.request(
+            "GET",
+            f"/organizations/{organization_id}/team/{team_id}/memberships/{quote(login, safe='')}",
+            token=token,
+        )
+        if response.status_code == 404:
+            return False
+        try:
+            return TeamMembership.model_validate(response.json()).state == "active"
+        except (ValidationError, ValueError):
+            raise DomainError(
+                "provider_unavailable", "Invalid GitHub team membership", 503
+            ) from None
 
     def source_bindings(
         self, token: str, full_name: str, commit: str, files: tuple[str, ...]

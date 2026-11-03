@@ -217,6 +217,50 @@ class RoleChange(Contract):
     repository_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
+class KnowledgePermission(StrEnum):
+    READ = "knowledge.read"
+    WRITE = "knowledge.write"
+
+
+class CustomRolePermissions(Contract):
+    permissions: tuple[KnowledgePermission, ...] = Field(min_length=1, max_length=2)
+
+    @model_validator(mode="after")
+    def valid_permissions(self) -> "CustomRolePermissions":
+        if len(set(self.permissions)) != len(self.permissions):
+            raise ValueError("Duplicate permissions")
+        if (
+            KnowledgePermission.WRITE in self.permissions
+            and KnowledgePermission.READ not in self.permissions
+        ):
+            raise ValueError("Knowledge write requires knowledge read")
+        return self
+
+
+class CustomRoleRequest(CustomRolePermissions):
+    description: str = Field(default="", max_length=512)
+    expected_version: StrictInt = Field(ge=0)
+
+
+class CustomRoleGrantRequest(Contract):
+    user_id: str = Field(min_length=1, max_length=64)
+    custom_role_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,63}$")
+    repository_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class TeamRoleRequest(Contract):
+    team_slug: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,99}$")
+    role: Literal["learner", "maintainer"] | None = None
+    custom_role_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{1,63}$")
+    repository_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def one_target(self) -> "TeamRoleRequest":
+        if (self.role is None) == (self.custom_role_id is None):
+            raise ValueError("Choose exactly one built-in content role or custom role")
+        return self
+
+
 class InvitationRequest(Contract):
     github_id: str = Field(pattern=r"^[0-9]+$", max_length=32)
     repository_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
@@ -485,3 +529,14 @@ class SpeakRequest(Contract):
     text: str = Field(min_length=1, max_length=2000)
     voice: str = Field(min_length=1, max_length=100)
     language: str = Field(default="en-IN", max_length=32)
+
+
+class PublicationPolicyRequest(Contract):
+    expected_version: StrictInt = Field(ge=0)
+    required_maintainers: StrictInt = Field(ge=1, le=5)
+
+
+class DraftApprovalRequest(Contract):
+    policy_version: StrictInt = Field(ge=0)
+    review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_snapshot_id: str | None

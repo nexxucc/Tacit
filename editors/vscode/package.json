@@ -1,0 +1,25 @@
+{
+  "name": "tacit-source-selection",
+  "displayName": "Tacit Source Selection",
+  "description": "Export source-bound file, range and symbol selections for human-reviewed Tacit teaching.",
+  "version": "0.1.0",
+  "publisher": "tacit-local",
+  "engines": {"vscode": "^1.85.0"},
+  "main": "./extension.js",
+  "extensionKind": ["workspace"],
+  "capabilities": {"untrustedWorkspaces": {"supported": false}, "virtualWorkspaces": {"supported": false}},
+  "contributes": {
+    "commands": [
+      {"command": "tacit.captureFile", "title": "Tacit: Export Active File Context"},
+      {"command": "tacit.captureSelection", "title": "Tacit: Export Selected Lines Context"},
+      {"command": "tacit.captureSymbol", "title": "Tacit: Export Symbol Context"}
+    ],
+    "configuration": {
+      "title": "Tacit",
+      "properties": {
+        "tacit.cliPath": {"type": "string", "default": "tacit", "scope": "machine", "description": "Installed Tacit executable path (not a shell command)."}
+      }
+    }
+  },
+  "scripts": {"test": "node --test extension.test.js"}
+}

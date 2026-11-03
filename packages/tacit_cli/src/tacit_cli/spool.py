@@ -36,8 +36,8 @@ def root() -> Path:
 
 
 @contextmanager
-def capacity_lock() -> Iterator[None]:
-    path = root() / ".capacity.lock"
+def capacity_lock(path: Path | None = None) -> Iterator[None]:
+    path = path if path is not None else root() / ".capacity.lock"
     reject_redirected_path(path)
     fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
