@@ -66,10 +66,6 @@ Revocation is checked during long operations and again before results are delive
 
 Provider keys (Prisma for speech to text, Evon for optional reasoning, Timbre for optional speech) never leave the backend. Audio and credentials are stored encrypted with one stable encryption key, so losing that key makes retained encrypted data unreadable. Published history is immutable, uncertain paid operations are never silently replayed, and the same operation ID can only be reused with its original unchanged input.
 
-## Where this stands
-
-This is a development checkout, not a validated public release. The core flows (teaching, publication, retrieval, quorum, team roles, remote MCP, recovery) have been tested, some of them live. Native Windows/macOS device checks, live Evon quality, production DNS/TLS and a controlled human handoff study are still open. The sections below list exactly what was tested, what wasn't, and how to run everything.
-
 ## What you can do
 
 - **Teach in text or voice:** record locally, inspect live transcript previews, pause/resume capture and recover retained audio after interruptions.
@@ -165,8 +161,6 @@ Use repository IDs returned by discovery, full pushed commit SHAs and canonical 
 
 ## Documentation
 
-All detailed guides live in the repository root. They preserve the material previously collected in this README, with dated demonstrations collected separately so setup instructions stay easy to find.
-
 ### Setup and system design
 
 - **[Backend setup and authentication](GETTING_STARTED.md)** — Configure the backend, run migrations and services, complete GitHub device login, and understand credential and version requirements.
@@ -190,9 +184,3 @@ All detailed guides live in the repository root. They preserve the material prev
 
 - **[Testing and evaluation](VERIFICATION.md)** — Run lint, formatting, typing and test checks; configure disposable PostgreSQL coverage; and understand scenario, handoff and external acceptance gates.
 - **[Verification and acceptance history](ACCEPTANCE_HISTORY.md)** — Read the original dated regression results, operator voice/MCP/team/quorum/offline demonstrations, incident fixes and evidence limits.
-
-## Project status
-
-Tacit is a development checkout rather than a validated public release. Text/voice teaching, pinned reads, team/custom roles, remote MCP/OAuth, editor selections, publication quorum and offline text synchronization are implemented. Recorded operator checks include Arch voice/editor workflows, scoped MCP reads and revocation, two-human quorum publication and basic offline-to-online text synchronization.
-
-Native Windows/macOS device acceptance, independent quality/handoff evaluation and production deployment/storage gates remain separate. Offline synchronization currently covers text intent; saved audio uses the existing voice recovery workflow. Consult [verification](VERIFICATION.md) and the dated [acceptance history](ACCEPTANCE_HISTORY.md) before treating a feature as validated for a particular environment.
