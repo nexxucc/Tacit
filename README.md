@@ -2,914 +2,197 @@
 
 Voice-authored, source-bound, versioned project knowledge for humans and coding agents.
 
-Maintainers explain intent through text or native audio, inspect transcripts and grounded proposals, resolve ambiguity, and explicitly confirm publication. Learners and delegated agents retrieve the same immutable snapshots read-only. Exact retrieval uses no speech or reasoning provider.
+## The problem
 
-## Current status
+Code shows what a system does, but not why. The reasoning behind a rule, like "a job result can only be published while the worker still holds a valid lease", usually lives in someone's head, an old chat thread, or a PR comment nobody can find. New teammates have to ask around, and coding agents just guess from the code, which is how they confidently break rules nobody wrote down.
 
-First-line verification completed on 2026-10-31 using thirteen feature-specific adversarial agents. Python 3.12, 3.13 and 3.14 each passed **567 tests with 26 explained skips and zero failures**. Twenty skips are SQLite concurrency variants whose PostgreSQL counterparts ran; six require explicit live Evon configuration. Ruff lint, formatting and strict mypy pass. All seven workspace packages built successfully, producing fourteen wheel/sdist archives. Client-only wheel installation and real loopback CLI/MCP/WebSocket checks passed.
+Tacit gives that reasoning a proper home. A maintainer explains intent out loud (or in text), Tacit ties it to the exact files and commit it's about, and after a human reviews and confirms it, it becomes versioned knowledge that learners and coding agents can query later. Agents can read it but never write it.
 
-Tests reproduced and fixed buffered-audio loss, cancellation races, outside-collaborator invitation scoping, question reservation races, worker starvation, unsafe artifact failures, interrupted recovery, and Git-option injection in local source capture. Three nonfatal Starlette test-adapter deprecation warnings remain per runtime run.
+## The main ideas
 
-Windows/macOS implementation and device-free fixtures exist; native platform/device acceptance is pending. Real providers, model quality and deployed operations have separate acceptance gates below. This is a development checkout, not a validated public release.
+- **Intent comes from a human.** A maintainer speaks or types an explanation. Nothing is published unless a person explicitly confirms it.
+- **Knowledge is bound to source.** Every draft points at specific files in a specific pushed 40-character commit SHA, so it's always clear what code the knowledge was written about. Uncommitted local edits are recorded as hashes but never count as verified evidence.
+- **Knowledge is immutable and versioned.** Publishing creates a new snapshot of the repository's knowledge. Old snapshots never change, history can be followed revision by revision, and a stale publication fails instead of overwriting newer work.
+- **Reading is cheap and safe.** Learners and agents read a pinned snapshot read-only. Exact retrieval uses no speech or AI provider at all, so it costs nothing and gives the same answer every time.
+- **When unsure, it abstains.** If the retrieved context is incomplete, stale or conflicting, Tacit says so instead of making something up.
 
-## Architecture and trust boundaries
+## How it works end to end
 
-- `packages/tacit_contracts`: shared Pydantic contracts and API/schema/evaluator versions.
-- `packages/tacit_domain`: authorization and bounded deterministic knowledge/rule evaluation.
-- `packages/tacit_client`: authenticated HTTP/WebSocket SDK and secure credential handling.
-- `packages/tacit_cli`: native recording, durable recovery, teaching, review and retrieval.
-- `packages/tacit_mcp`: six read-only local stdio tools.
-- `services/api`: GitHub identity, publication, source grounding, provider adapters and encrypted storage.
-- `services/worker`: transactional outbox projection, reconciliation and retention.
-- `migrations`: PostgreSQL schema and immutability constraints.
-- `deploy`, `scripts`, `site`: deployment/recovery/install tooling and static landing page.
+1. **Teach.** A maintainer runs `teach` (text) or `teach-voice` (microphone) against a repo, a pushed commit and one or more files. Audio is captured locally, uploaded in durable chunks, and transcribed by Prisma. With `--live-transcript` you see provisional text while you speak. If an upload gets interrupted, the recording stays on disk and can be resumed.
+2. **Draft.** Tacit creates a private draft containing the transcript (original evidence is always kept, even if you correct it), the source bindings, and a proposed statement of the rule. Optionally Evon can extract grounded candidate decisions and Timbre can read clarification questions aloud, but both are optional and the keys stay on the backend.
+3. **Review.** The maintainer reads the draft, fixes the wording, answers any clarifying questions, and resolves ambiguity. A correction is a human edit layered on top of the preserved original, not a replacement for it.
+4. **Confirm.** Only an explicit `confirm` publishes. It's tied to the reviewed digest and the expected parent snapshot. If the repository requires several maintainers, other distinct people must have approved that exact draft first (the quorum can be 1 to 5 people).
+5. **Publish.** In one atomic step Tacit writes an immutable revision, a new snapshot manifest, an audit record and an outbox record. The worker then projects it for retrieval.
+6. **Consume.** Anyone with read access (or a scoped agent) pulls it back out:
+   - `context` returns the confirmed decisions that apply to given files at a given commit, with citations. It warns when some retained knowledge came from other commits.
+   - `ask` does exact retrieval of confirmed statements. Adding `--reason` explicitly asks for cited reasoning from Evon, which may cost credits.
+   - `evaluate` runs a scenario against confirmed typed rules and answers permitted, forbidden, unknown or conflict. It only works for supported rule domains (currently scheduler rules), and it's not a proof about arbitrary code.
+   - `history` follows the revision lineage of a decision.
+   - Coding agents get the same reads through six read-only MCP tools, either as a local stdio server or as an optional remote server with repository-scoped OAuth.
 
-PostgreSQL is the shared authority; SQLite is fixture-only. Prisma performs speech-to-text, Evon performs optional grounded reasoning, and Timbre synthesizes optional clarification speech. Provider keys remain on the backend. The product has no browser recorder or web dashboard.
+## Vocabulary
 
-Each personal GitHub account or organization installation maps to a workspace. GitHub eligibility and explicit scoped roles both constrain access. Workspace administration alone does not permit knowledge publication. Learners and all delegated agents remain read-only, including agents acting for maintainers. Outside collaborators require scoped invitations. Revocation is checked during long operations and before delivering results.
+| Term | Meaning |
+|---|---|
+| Workspace | A GitHub personal account or organization installation. |
+| Repository | A GitHub repo enabled inside a workspace. Knowledge is stored per repository. |
+| Draft | A private, unpublished proposal built from a teaching session. Only its author and permitted maintainers can see it. |
+| Decision | One confirmed statement of intent, optionally with a typed rule that can be evaluated. |
+| Revision | One immutable version of a decision. Later edits add revisions, they never rewrite old ones. |
+| Snapshot | The full set of published knowledge for a repository at one point in time. The latest one is the head. |
+| Lockfile | A small file that pins a repository to one exact snapshot, so tools keep using it even after the head moves. |
 
-Drafts bind exact repository files and commits. Human confirmation uses the reviewed digest and expected parent snapshot. Publications atomically create immutable revisions, snapshot manifests, audit and outbox records. Concurrent stale publications fail rather than overwrite history. Reuse an operation ID only with its original unchanged input. Uncertain paid operations are never silently replayed.
+## Who can do what
 
-## Backend setup
+Access comes from GitHub identity plus explicit Tacit roles. Both have to allow it.
 
-Use Python 3.12–3.14, uv, PostgreSQL and a configured GitHub App. From the checkout:
+- **Learners** read confirmed knowledge, ask questions and evaluate scenarios.
+- **Maintainers** are humans who can teach, review, correct and publish. Custom roles and GitHub team mappings can grant this too.
+- **Administrators** manage roles, mappings and publication policy, but being an administrator alone does not allow publishing knowledge.
+- **Agents** are always read-only, even when they act on behalf of a maintainer. They can't teach, approve or publish.
+
+Revocation is checked during long operations and again before results are delivered.
+
+## What's in the box
+
+- `tacit` / `tacit-intent` CLI for recording, teaching, review, confirmation, retrieval, snapshot export/lockfiles, role and quorum administration, and an offline queue for preparing text teaching without a connection and syncing it later as a private draft.
+- A VS Code extension (local, not on the Marketplace) that exports a file, a selection or a symbol as source context for teaching.
+- `tacit-mcp` for agents, local stdio or remote Streamable HTTP with OAuth.
+- An API service and a worker, with PostgreSQL as the single source of truth (SQLite is only used in test fixtures). The worker handles the outbox, reconciliation and retention.
+- Deployment tooling: a Docker Compose stack with a Caddy TLS proxy, plus backup and restore scripts for the database, encrypted artifacts and the encryption key.
+- There is deliberately no browser recorder and no web dashboard. Everything goes through the CLI, the editor adapter and MCP.
+
+## Trust boundaries in one paragraph
+
+Provider keys (Prisma for speech to text, Evon for optional reasoning, Timbre for optional speech) never leave the backend. Audio and credentials are stored encrypted with one stable encryption key, so losing that key makes retained encrypted data unreadable. Published history is immutable, uncertain paid operations are never silently replayed, and the same operation ID can only be reused with its original unchanged input.
+
+## Where this stands
+
+This is a development checkout, not a validated public release. The core flows (teaching, publication, retrieval, quorum, team roles, remote MCP, recovery) have been tested, some of them live. Native Windows/macOS device checks, live Evon quality, production DNS/TLS and a controlled human handoff study are still open. The sections below list exactly what was tested, what wasn't, and how to run everything.
+
+## What you can do
+
+- **Teach in text or voice:** record locally, inspect live transcript previews, pause/resume capture and recover retained audio after interruptions.
+- **Review before publishing:** correct transcripts, clarify grounded proposals and confirm an exact draft against its expected parent snapshot.
+- **Share controlled knowledge:** use GitHub workspaces, scoped roles, team mappings and human approval quorums.
+- **Connect coding agents:** retrieve source-bound context through local stdio MCP or optional remote MCP with repository-scoped OAuth.
+- **Pin and work offline:** export immutable snapshots for offline reads, or queue text intent and explicitly sync it into private drafts later.
+- **Select source from your editor:** export files, ranges or symbols through the VS Code adapter, including local dirty-file metadata.
+
+## Tech stack
+
+| Area | Technologies and role |
+|---|---|
+| Runtime and packaging | Python 3.12–3.14, uv workspaces and a frozen dependency lockfile |
+| Backend | FastAPI and Uvicorn for HTTP/WebSockets; Pydantic contracts and settings |
+| Persistence | PostgreSQL, SQLAlchemy, psycopg and Alembic; SQLite is used only for fixtures |
+| Native client | Typer and Rich CLI, Textual review UI, sounddevice/PortAudio for recording and playback |
+| Identity and credentials | GitHub App/device flow, OS keyring, scoped delegation and Fernet-encrypted backend credentials/artifacts |
+| Agent integration | MCP SDK; stdio and optional Streamable HTTP with OAuth and S256 PKCE |
+| Optional speech and reasoning | Gnani Prisma for speech-to-text, Evon for grounded reasoning, Gnani Timbre for clarification speech |
+| Storage and operations | Local encrypted artifacts or S3-compatible storage via boto3; Docker Compose and optional Caddy TLS |
+| Editor and quality tooling | JavaScript VS Code extension; pytest, Ruff and strict mypy |
+
+See [system design](SYSTEM_DESIGN.md) for package responsibilities and trust boundaries, and [deployment](DEPLOYMENT.md) for storage and recovery details.
+
+## Quickstart
+
+You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/) and a compatible Python interpreter. A backend also needs PostgreSQL and a configured GitHub App. These shell examples target a POSIX terminal; [platform setup](PLATFORM_SETUP.md) includes native Windows PowerShell and macOS instructions.
+
+### Connect a client to an existing backend
 
 ```sh
-uv sync --frozen
-# Create .env from .env.example only if it does not already exist.
-# Configure PostgreSQL, GitHub and a stable credential encryption key privately.
-uv run --env-file .env alembic upgrade head
-uv run --env-file .env tacit-api
-# In another terminal:
-uv run --env-file .env tacit-worker
-```
+git clone https://github.com/nexxucc/Tacit.git
+cd Tacit
 
-Preserve the existing encryption key: replacing it makes retained encrypted credentials/objects unreadable. Keep secrets out of Git. The API does not automatically load `.env`. `/health/live` checks process availability; `/health/ready` checks backend readiness, not model quality or availability. Never use the knowledge database as a disposable test database.
+uv sync --frozen --package tacit-cli --package tacit-mcp --no-default-groups
 
-```sh
-export TACIT_API_URL=http://127.0.0.1:8000
+# Replace this with your trusted backend URL.
+export TACIT_API_URL=https://YOUR-TACIT-HOST
 uv run --no-sync tacit login
 uv run --no-sync tacit whoami
 uv run --no-sync tacit workspaces list
 uv run --no-sync tacit repos list --workspace WORKSPACE_ID
 ```
 
-Complete GitHub's device flow. Human credentials use an approved OS keyring without plaintext fallback; delegated reads require `TACIT_AGENT_TOKEN`. HTTPS is required except on loopback. API/schema versions are `1`; evaluator version is `typed-expression-v2`. Explicit incompatible declarations receive `426 upgrade_required`; versionless legacy peers follow the implemented compatibility bridge.
+Complete GitHub's device flow in your browser. Human credentials are stored in an approved OS keyring; agent reads use a scoped `TACIT_AGENT_TOKEN`. HTTPS is required except on loopback. Speech and model API keys are configured on the backend, not in the client.
 
-## Teaching and consumption
+For microphone support, use the platform installer with its audio option. The installer creates the `tacit-intent` launcher; inside a development checkout, `uv run --no-sync tacit` invokes the same CLI. See [client installation and audio setup](PLATFORM_SETUP.md).
+
+### Run your own development backend
+
+From the checkout, with PostgreSQL available:
 
 ```sh
-uv run --no-sync tacit teach --repo REPO_ID --commit PUSHED_COMMIT_SHA \
+uv sync --frozen
+
+# Preserve an existing .env.
+if [ ! -e .env ]; then cp .env.example .env; fi
+```
+
+Edit `.env` before continuing. Set `TACIT_DATABASE_URL`, `TACIT_GITHUB_APP_ID`, `TACIT_GITHUB_CLIENT_ID` and a stable `TACIT_CREDENTIAL_ENCRYPTION_KEY`; configure the webhook secret when accepting GitHub webhooks. The GitHub App needs device flow and the permissions described in `.env.example`. Speech/reasoning settings are optional for text teaching and exact retrieval. Keep the encryption key stable so retained encrypted credentials and objects remain readable.
+
+```sh
+# Migrate the selected database, then start the API.
+uv run --env-file .env --no-sync alembic upgrade head
+uv run --env-file .env --no-sync tacit-api
+```
+
+In another terminal, from the same checkout:
+
+```sh
+uv run --env-file .env --no-sync tacit-worker
+```
+
+Connect a local client with `export TACIT_API_URL=http://127.0.0.1:8000`. Check readiness with `curl --fail-with-body http://127.0.0.1:8000/health/ready`; this checks backend readiness, not provider quality. The API does not automatically load `.env`, which is why the server commands pass `--env-file` explicitly. See [backend setup](GETTING_STARTED.md) for authentication details and [deployment](DEPLOYMENT.md) for Compose, TLS and backup procedures.
+
+### Teach, review and retrieve
+
+```sh
+uv run --no-sync tacit teach \
+  --repo REPO_ID --commit PUSHED_40_CHARACTER_SHA \
   --file path/to/source.py --text-file /path/to/intent.txt
+
 uv run --no-sync tacit review DRAFT_ID --repo REPO_ID
 uv run --no-sync tacit confirm DRAFT_ID --repo REPO_ID
-uv run --no-sync tacit repos head --repo REPO_ID
-uv run --no-sync tacit context --repo REPO_ID --snapshot SNAPSHOT_ID \
-  --commit PUSHED_COMMIT_SHA --files path/to/source.py
+
+uv run --no-sync tacit context \
+  --repo REPO_ID --snapshot SNAPSHOT_ID \
+  --commit PUSHED_40_CHARACTER_SHA --files path/to/source.py
 ```
 
-Use full pushed 40-character commit SHAs and canonical repository-relative paths with `/`. `teach` creates a private draft; only explicit `confirm` publishes. Transcript corrections preserve the original evidence. `teaching extract/list/review/answer/draft/cancel/speak` provides grounded candidates, clarification, Textual review and optional speech; use command `--help` for required arguments. Source selections include dirty hashes but never turn uncommitted bytes into verified commit evidence.
+Use repository IDs returned by discovery, full pushed commit SHAs and canonical repository-relative paths. `teach` creates a private draft; `confirm` publishes only after the permission, digest, snapshot and configured quorum checks pass. The [teaching guide](TEACHING.md) explains proposals, typed-rule evaluation and history; the [voice guide](VOICE.md) covers microphone capture and transcription.
 
-`ask --reason` explicitly requests cited reasoning. Incomplete, stale or conflicting context causes abstention. `evaluate` applies only to supported confirmed scheduler rules and returns permitted, forbidden, unknown or conflict. It is not a proof about arbitrary scheduler implementations. `history` follows immutable revision lineage.
+## Documentation
 
-```sh
-uv run --no-sync tacit-mcp
-# Or:
-uv run --no-sync tacit mcp
-```
+All detailed guides live in the repository root. They preserve the material previously collected in this README, with dated demonstrations collected separately so setup instructions stay easy to find.
 
-Local MCP exposes `list_workspaces`, `list_repositories`, `get_context`, `ask_repository`, `evaluate_scenario` and `get_decision_history`. Configure a scoped agent credential privately in the host environment. MCP stdout contains protocol messages; diagnostics use stderr. Exact agent reads require zero STT/TTS calls. Optional Streamable HTTP with repository-scoped OAuth is implemented; see [Remote MCP with OAuth](#remote-mcp-with-oauth).
+### Setup and system design
 
-## Arch client and recording
+- **[Backend setup and authentication](GETTING_STARTED.md)** — Configure the backend, run migrations and services, complete GitHub device login, and understand credential and version requirements.
+- **[Client installation and native platforms](PLATFORM_SETUP.md)** — Install Arch, Windows and macOS launchers; enable audio; locate private client data; and handle existing recordings and native permissions.
+- **[System design and trust boundaries](SYSTEM_DESIGN.md)** — Explore the seven workspace packages, PostgreSQL authority, source bindings, provider separation and human-only publication rules.
 
-```sh
-bash scripts/install-arch.sh --audio
-# Arch audio additionally needs the system PortAudio package.
-tacit-intent doctor
-tacit-intent audio devices
-tacit-intent audio devices --output
-```
+### Teaching and collaboration
 
-The checkout launcher is `tacit-intent`; installers refuse existing executables. Other tools already use the name `tacit`, so public distribution naming remains unresolved. No market-first claim is established.
+- **[Teaching and retrieving knowledge](TEACHING.md)** — Follow text teaching, draft review, explicit publication, pinned context retrieval, optional reasoning, supported typed-rule evaluation and immutable history.
+- **[Voice capture and live transcription](VOICE.md)** — Use provisional transcripts, sequenced capture, pause/resume and retained-audio recovery, including the transport and finalization boundaries.
+- **[Access control and publication approvals](ACCESS_AND_APPROVALS.md)** — Configure team-to-role mappings, custom roles and repository approval policies; understand distinct-human counting, withdrawal, revocation and policy versions.
+- **[Editor source selections](EDITOR_INTEGRATION.md)** — Build and install the VS Code adapter, export files/ranges/symbols, and validate commit bindings and changed-source hashes before teaching.
 
-`teach-voice` defaults to recoverable sequenced capture/upload. `voice list/resume/cancel/export/forget` manages retained recordings. Capture uses mono PCM16 at 16 kHz with bounded queues and duration. Press `p` + Enter to pause, `r` + Enter to resume, empty Enter to finish, or Ctrl+C to cancel. Paused microphone input is discarded; retained sessions still expire by wall clock. `audio play FILE --device ID` selects an output; `teaching speak --output-device ID` selects synthesized playback output.
+### Agents, offline work and operations
 
+- **[Coding-agent integration and remote OAuth](MCP.md)** — Configure the six read-only tools through stdio or remote HTTP, including registered clients, consent, scoped tokens, expiry and revocation.
+- **[Snapshots, exports and offline teaching](SNAPSHOTS_AND_OFFLINE.md)** — Pin snapshots, verify offline exports, queue text intent, recover interrupted synchronization and explicitly rebase unattempted entries.
+- **[Deployment, backups and recovery](DEPLOYMENT.md)** — Set up Caddy TLS, create database or full local recovery bundles, restore to empty targets, and review the separate S3 recovery procedure.
 
-## Native Windows and macOS clients
+### Verification and evidence
 
-## Windows checkout install
+- **[Testing and evaluation](VERIFICATION.md)** — Run lint, formatting, typing and test checks; configure disposable PostgreSQL coverage; and understand scenario, handoff and external acceptance gates.
+- **[Verification and acceptance history](ACCEPTANCE_HISTORY.md)** — Read the original dated regression results, operator voice/MCP/team/quorum/offline demonstrations, incident fixes and evidence limits.
 
-Use native Windows PowerShell 5.1 or PowerShell 7, Git, and [uv](https://docs.astral.sh/uv/getting-started/installation/). The project requires Python 3.12–3.14; uv may provision a compatible interpreter according to its configuration. Keep this checkout and uv at their installation paths. Review scripts before executing and follow the machine's execution policy; the installer does not alter that policy, PATH or system settings.
+## Project status
 
-From the checkout:
+Tacit is a development checkout rather than a validated public release. Text/voice teaching, pinned reads, team/custom roles, remote MCP/OAuth, editor selections, publication quorum and offline text synchronization are implemented. Recorded operator checks include Arch voice/editor workflows, scoped MCP reads and revocation, two-human quorum publication and basic offline-to-online text synchronization.
 
-```powershell
-.\scripts\install-windows.ps1 -Audio
-```
-
-Omit `-Audio` for text-only use. The script synchronizes the locked CLI/MCP workspace packages without backend/dev dependencies and creates `tacit-intent.ps1` and `tacit-mcp.ps1` in `$env:LOCALAPPDATA\Tacit\bin`. Existing commands/files are refused before synchronization. It creates no `tacit` alias that might replace an unrelated command. The launchers preserve the child exit code and inherited console streams. Use `-BinDirectory 'C:\your\directory'` for an explicit launcher directory.
-
-```powershell
-$env:TACIT_API_URL = 'https://YOUR-TACIT-HOST'
-& "$env:LOCALAPPDATA\Tacit\bin\tacit-intent.ps1" doctor
-& "$env:LOCALAPPDATA\Tacit\bin\tacit-intent.ps1" login
-& "$env:LOCALAPPDATA\Tacit\bin\tacit-intent.ps1" audio devices
-& "$env:LOCALAPPDATA\Tacit\bin\tacit-intent.ps1" audio devices --output
-```
-
-Use loopback HTTP only when the backend or its local SSH tunnel is on this machine. `https://YOUR-TACIT-HOST` is a placeholder, not an existing deployment. Windows microphone access and desktop-app microphone access must be enabled in Settings → Privacy & security → Microphone. A machine policy may require its administrator to enable access; Tacit does not change the policy. See [Microsoft's microphone permissions guidance](https://support.microsoft.com/en-us/windows/privacy/turn-on-app-permissions-for-your-microphone-in-windows).
-
-## macOS checkout install
-
-Use a native terminal with Git and uv. Apple Silicon and Intel are implementation targets where compatible Python and dependency wheels are available; neither architecture has been verified in this pass.
-
-```sh
-bash scripts/install-macos.sh --audio
-export PATH="$HOME/.local/bin:$PATH"
-export TACIT_API_URL='https://YOUR-TACIT-HOST'
-tacit-intent doctor
-tacit-intent login
-tacit-intent audio devices
-tacit-intent audio devices --output
-```
-
-Omit `--audio` for text-only use. The installer creates `tacit-intent` and `tacit-mcp` under `${XDG_BIN_HOME:-$HOME/.local/bin}`, refuses existing commands, and pins launchers to the checkout and uv executable. It does not use sudo, install Homebrew or modify shell startup files. Allow the terminal/IDE that launches Tacit under System Settings → Privacy & Security → Microphone. See [Apple's microphone settings guidance](https://support.apple.com/en-au/guide/mac-help/mchl211c911f/mac).
-
-The upstream [sounddevice installation instructions](https://github.com/spatialaudio/python-sounddevice/blob/master/doc/installation.rst) describe bundled PortAudio on Windows/macOS. The audio extra selects the locked dependency; missing native libraries or unsupported architectures produce setup guidance. Linux still requires the platform's PortAudio package. No new dependency or lockfile version is required for these changes.
-
-## Native data paths and existing recordings
-
-| System | Configuration | Retained voice |
-|---|---|---|
-| Windows | `%APPDATA%\Tacit\config.json` | `%LOCALAPPDATA%\Tacit\voice` |
-| macOS | `~/Library/Application Support/Tacit/config.json` | `~/Library/Application Support/Tacit/voice` |
-| Linux | `${XDG_CONFIG_HOME:-~/.config}/tacit/config.json` | `${XDG_STATE_HOME:-~/.local/state}/tacit/voice` |
-
-Existing legacy `~/.config/tacit/config.json` and `~/.local/state/tacit/voice` paths remain selected when present. `TACIT_CONFIG` and `TACIT_VOICE_SPOOL` overrides remain supported. Data is not moved or deleted automatically. `doctor` reports selected paths without creating them or opening an audio device. Windows storage requires filesystem support for private ACLs; an unsupported location fails rather than claiming privacy from `chmod` alone.
-
-Input text/scenario/clarification files are read as UTF-8 across platforms. Audio exports use private exclusive creation and never overwrite an existing target. Snapshot and source paths remain canonical repository-relative paths using `/`, even when the checkout is on Windows.
-
-## Local MCP hosts
-
-For a Windows MCP host, configure the executable as the absolute path to `powershell.exe` or `pwsh.exe`, with arguments `-NoProfile`, `-File`, and the absolute path to `tacit-mcp.ps1`. The host's PowerShell execution policy must permit that script. For macOS, use the absolute `tacit-mcp` launcher path. Supply `TACIT_API_URL` and a scoped `TACIT_AGENT_TOKEN` through the host's private environment; do not put secrets in repository examples. Launchers inherit stdin/stdout/stderr for stdio MCP. Codex CLI live acceptance is recorded below; Claude Code acceptance is waived at the user’s request; it has not been tested.
-
-For direct checkout commands after client installation, use `uv run --no-sync --package tacit-cli tacit ...` or `uv run --no-sync --package tacit-mcp tacit-mcp`. A later full `uv sync` changes the shared checkout environment to include backend/dev dependencies; a later client-only install synchronizes it back to the selected client packages. Use a separate checkout for a backend environment you need to preserve.
-
-
-## Incremental transcripts
-
-## User flow
-
-The default `teach-voice` workflow still captures and uploads recoverable audio first, then starts transcription. The optional `--live-transcript` flag starts a single Prisma realtime attempt while the microphone is active. It is available only for native microphone capture with the durable streaming workflow; file uploads and the legacy `--clip` path do not use it.
-
-```sh
-uv run --no-sync --package tacit-cli tacit teach-voice \
-  --repo REPOSITORY_ID \
-  --commit PUSHED_40_CHARACTER_COMMIT \
-  --file path/to/source.py \
-  --seconds 65 \
-  --language en-IN \
-  --live-transcript
-```
-
-The command asks for explicit consent before the provider stream and microphone start. Starting realtime can consume credits even when recording is cancelled or the final request fails. Provider credentials remain on the backend. A backend without the live capability is rejected before capture.
-
-Completed provider segments are displayed incrementally on stderr as provisional text. They are not invented word-by-word partials. The live adapter requests a five-second maximum speech segment through Prisma's `x-max-speech-s` setting; this is a segmentation setting, not a measured latency guarantee. Speech activity/segment completion determines when a new segment is available; there may be a delay after speaking starts. Provider text is sanitized before terminal display. Final command JSON remains on stdout. Interim text is not a confirmed rule or a published snapshot.
-
-Recording controls remain `p` + Enter to pause, `r` + Enter to resume, empty Enter to finish and Ctrl+C to cancel. A pause retains the same provider attempt. Tacit does not fill pauses with silence or reconnect the paid provider stream automatically; sufficiently long pauses or connection loss can end that attempt. Local transport heartbeat does not guarantee the provider will keep its session open.
-
-## Transport and durable boundaries
-
-`GET /v1/repos/{rid}/voice-capabilities` declares `live_transcript`. The additional WebSocket route is `/v1/repos/{rid}/voice-sessions/{sid}/live`. It requires a fresh empty session belonging to the authenticated human maintainer; agents and learners cannot start it. Existing version headers apply to its handshake.
-
-| Direction | Frame | Meaning |
-|---|---|---|
-| Server → client | `{"type":"session","session":...}` | Reserved live session |
-| Client → server | Binary: eight-byte big-endian sequence followed by PCM16 | One durable audio chunk, at most one second |
-| Server → client | `{"type":"ack","chunks":N}` | Durable chunk count |
-| Server → client | `{"type":"transcript","segment":...}` | Validated provider segment with index, ID and text |
-| Client → server | `{"type":"ping"}` | Local transport heartbeat |
-| Server → client | `{"type":"pong"}` | Heartbeat response |
-| Client → server | `{"type":"finish","chunks":N,"audio_sha256":"...","capture_complete":true}` | End capture and bind the exact retained audio |
-| Server → client | `{"type":"result","session":...}` | Final validated session result |
-| Server → client | `{"type":"error","code":"..."}` | Safe failure code; no provider payload or credential |
-
-Audio is retained locally and acknowledged only after encrypted backend storage. The backend reserves the operation before opening a provider stream and validates the final audio digest and source binding. Authorization is checked throughout the connection and before delivering transcript/final results. Resource queues, message sizes and deadlines are bounded. No remote MCP or new agent write capability is added.
-
-The provider receives sequenced capture through one stream, with its required framing and final flush; successful live capture does not trigger a second post-recording transcription. Provider segments are validated for identity, size and ordering before display. Final transcript evidence is saved through the existing reviewable draft workflow. Explicit human `review`/`confirm` remains required to publish repository knowledge.
-
-The shared provider parser also recognizes the documented one-based segment indexes as well as contiguous zero-based legacy indexes, without rewriting source evidence. Previously a valid one-based response could be marked incomplete. Settings and framing were checked against [Gnani's realtime documentation](https://docs.gnani.ai/api/STT/stt-websocket); that documentation does not establish live acceptance of this implementation.
-
-## Failure and recovery
-
-A lost live stream is not resumable as a paid stream. Preview text is not durable authoritative transcription. A failed, interrupted or ambiguous attempt retains local/server audio according to existing retention rules, but does not silently replay it. A saved final transcript can be recovered through the existing session recovery path without another provider call. Without a saved final transcript, deliberately starting a new operation is a separate potentially billable choice; export the retained WAV and inspect it first. Cancelling removes retained audio through the existing cancellation workflow; it cannot undo credits already used.
-
-
-## Deployment and recovery
-
-## Stable TLS endpoint
-
-Use an operator-controlled Linux host with Docker Compose, persistent storage,
-and a DNS hostname that resolves directly to that host. Permit inbound TCP 80 and
-443 for ACME/HTTPS; UDP 443 is optional HTTP/3. If publishing an AAAA record, its
-IPv6 route must also reach the host. A temporary tunnel URL is not stable hosting.
-
-Create a private checkout `.env` from `.env.example`. Configure a strong URL-safe
-`POSTGRES_PASSWORD`, stable `TACIT_CREDENTIAL_ENCRYPTION_KEY`, your GitHub App and
-webhook secret, and provider settings as needed. Keep `TACIT_DEMO=false`. Do not
-expose PostgreSQL or replace the API's loopback host-port binding. Configure:
-
-```dotenv
-TACIT_PUBLIC_HOST=tacit.example.org
-TACIT_ACME_EMAIL=operator@example.org
-```
-
-The hostname must contain only the real DNS name, with no scheme, path or port.
-The following are future operator commands, not a record of deployment:
-
-```bash
-docker compose --env-file .env -f deploy/compose.yaml \
-  -f deploy/compose.tls.yaml up -d --build
-```
-
-The migration service precedes the API. The base API readiness healthcheck must
-pass before Caddy starts. Caddy persists ACME state in `caddy-data`/`caddy-config`,
-redirects HTTP to HTTPS, proxies `/v1/*` and health routes, and refuses other paths.
-WebSocket upgrades for voice upload pass through the same proxy automatically;
-the proxy does not rewrite the webhook payload or signature headers. Access
-logging is not enabled, avoiding accidental credential/body logging.
-
-The TLS overlay trusts forwarded headers on the API's private container listener.
-Keep that listener behind Caddy and the host loopback binding; do not add a public
-8000 binding with `FORWARDED_ALLOW_IPS=*`. The proxy does not replace Tacit's
-credential, repository authorization, upload limits or GitHub HMAC checks.
-
-Clients use `TACIT_API_URL=https://tacit.example.org`. In the GitHub App General
-settings, set the webhook URL to
-`https://tacit.example.org/v1/github/webhooks`, keep the same private secret and
-SSL verification enabled, and subscribe to the needed Organization event. Actual
-certificate issuance, HTTPS/WebSocket connectivity and genuine delivery remain
-operator acceptance steps. No remote MCP/OAuth transport is added by this proxy.
-
-## Database-only backups remain available
-
-`scripts/backup.sh` and `scripts/restore.sh` remain the narrower database-only
-tools. They do not include artifact objects or the encryption key. A database
-dump alone is insufficient to recover encrypted voice/TTS artifacts or stored
-provider credentials. They use `deploy/compose.yaml` and the checkout `.env`.
-
-## Full local recovery bundle
-
-**A bundle contains private database knowledge, encrypted artifact objects, and
-a passphrase-wrapped copy of the matching stable encryption key. Protect the
-whole bundle and keep its passphrase separately. Losing the passphrase/key makes
-encrypted content unrecoverable.** Checksums alone are not authentication: the
-manifest also has a passphrase-derived HMAC, and the key is wrapped with Fernet
-using a separately salted Scrypt-derived key.
-
-The bundle deliberately excludes the whole `.env`, GitHub/provider configuration,
-provider API keys, Docker credentials, host TLS state, OS-keyring client tokens
-and CLI recording spools. Preserve required backend configuration separately in
-your secret manager. Caddy can issue new certificates for the same controlled
-hostname; backing up its ACME state is a separate operational choice.
-
-The tooling supports only the named local `artifacts` Compose volume. It fails
-closed if `TACIT_ARTIFACT_BUCKET` is configured. The current recovery bounds are
-100,000 archive entries, 100 GiB of object data, and 64 MiB per stored object.
-An unfinished recovery stage prevents a new backup.
-
-`scripts/recovery.sh` runs the standard-library/cryptography helper through this
-checkout's installed environment. Invoke it explicitly with `bash`:
-
-```bash
-# Stop all writers yourself. The recovery tools refuse running api/worker/migrate
-# services; they never stop/start them. Also stop any writers outside this stack.
-docker compose --env-file .env -f deploy/compose.yaml stop api worker migrate
-
-read -rsp 'Recovery passphrase (16+ characters): ' TACIT_RECOVERY_PASSPHRASE
-echo
-export TACIT_RECOVERY_PASSPHRASE
-bash scripts/recovery.sh backup --directory /private/tacit-backups
-unset TACIT_RECOVERY_PASSPHRASE
-```
-
-The private backup directory must be owned by the invoking user with mode 700.
-The command refuses unsafe existing permissions instead of changing them. It
-creates a unique hidden partial directory, captures a consistent PostgreSQL dump
-while writers remain stopped, captures the matching encrypted volume, wraps the
-key, authenticates/hashes the payloads, and publishes the completed directory.
-It never prints the encryption key, recovery passphrase, provider settings, or
-dump contents. The files are private (0600) and the bundle directory is 0700.
-If using a nondefault Compose project, export the same `TACIT_COMPOSE_PROJECT`
-used for deployment; otherwise recovery uses the normal `deploy` project.
-
-Quiescence is an operational requirement, not a global database lock: operators
-must prevent external database/object writers and avoid starting services while
-a bundle is created/restored. Copy only completed bundle directories off-host.
-Retain the original until a later separately authorized restore check succeeds.
-
-## Restore to an explicitly empty target
-
-Prepare the intended checkout/images and a private `.env` containing the matching
-GitHub/provider configuration and stable key. Build images if necessary. Start
-only PostgreSQL in the intended Compose project; do not start migrations, API,
-worker or Caddy. The target database must have no non-system schema objects, and
-the local artifact volume must be completely empty. Do not reuse production
-volumes or run a volume-deletion command to manufacture an empty target.
-
-If the stable key must be recovered first, write it to a new private file without
-printing it:
-
-```bash
-read -rsp 'Recovery passphrase: ' TACIT_RECOVERY_PASSPHRASE
-echo
-export TACIT_RECOVERY_PASSPHRASE
-bash scripts/recovery.sh recover-key --bundle /private/completed-bundle \
-  --output /private/recovered-secrets/credential-key.env
-```
-
-The output directory must be owned by the current user with mode 700; an existing
-output file is refused. Merge that one key setting privately into the target
-`.env` using your secret-management process. Do not paste it into chat or commit
-it. Recovery does not overwrite backend configuration automatically.
-
-```bash
-docker compose --env-file .env -f deploy/compose.yaml up -d postgres
-bash scripts/recovery.sh restore --bundle /private/completed-bundle \
-  --target empty-development
-unset TACIT_RECOVERY_PASSPHRASE
-```
-
-`empty-development` is an explicit safeguard acknowledgement, not permission to
-overwrite an existing target. Restore authenticates the manifest, verifies every
-payload checksum and archive path, requires the configured key to match exactly,
-checks database emptiness, and stages objects into the empty volume before
-restoring the database in a single transaction. It refuses archive symlinks,
-hardlinks, devices, duplicate entries and traversal paths. The API/worker remain
-stopped after success so the operator can review the result before startup.
-
-PostgreSQL and the object filesystem are separate stores: this tool does not claim
-an atomic commit across both. A failed or interrupted command leaves writers
-stopped and may retain a hidden, operation-bound artifact stage. Never restart
-writers or blindly rerun restore when the database outcome is uncertain.
-
-If the database commit receipt was written but filesystem activation failed,
-resume only that activation:
-
-```bash
-bash scripts/recovery.sh finish --bundle /private/completed-bundle \
-  --target empty-development
-```
-
-`finish` requires the matching stage's confirmed database-commit receipt and will
-not overwrite existing artifact destinations. The stage carries object size/hash
-inventory. Completed activation leaves a private
-`.tacit-recovery-completed-ID.json` receipt outside the stage; repeated completion
-validates activated objects and can finish interrupted metadata cleanup. These
-local receipts are excluded from artifact exports. Preserve them while recovering
-that operation; they are not application audio objects. If PostgreSQL is still completely
-empty, an uncommitted stage may instead be discarded explicitly:
-
-```bash
-bash scripts/recovery.sh discard --bundle /private/completed-bundle \
-  --target empty-development
-```
-
-If the connection was lost after database commit but before the receipt was
-written, neither automatic finish nor discard is safe. Independently inspect the
-target database against the chosen backup (including schema/migration version,
-known snapshot IDs and expected records) and the matching artifact stage while
-all writers stay stopped. Only after confirming that exact database restore
-committed, acknowledge its bundle `id` from `manifest.json` explicitly:
-
-```bash
-bash scripts/recovery.sh finish --bundle /private/completed-bundle \
-  --target empty-development --acknowledge-database-committed EXACT_BUNDLE_ID
-```
-
-This option writes the missing commit receipt for that same operation before
-activation. It is an operator attestation, not an automated database match check.
-Never use it merely because a database is nonempty or to bypass a failed restore.
-Without the acknowledgement, the tool fails closed rather than guessing whether
-the transaction committed. First-line fixture tests and an isolated PostgreSQL,
-encrypted-object and matching-key helper roundtrip now pass; see
-the test record (see this README). Actual deployed Compose
-permissions, full application recovery and power-loss behavior remain separate
-acceptance gates.
-
-## S3-compatible storage recovery
-
-Do not use the local-volume recovery command for S3. Freeze all writers, take a
-matching database dump, retain the bucket's versioned object inventory and the
-exact object versions referenced by artifact rows, and retain the stable key in
-your secret manager. Restore into a separate empty database/bucket, recover the
-same object keys/versions and configure the matching key before starting writers.
-Provider-specific snapshot/version-retention/export commands and IAM credentials
-belong to the operator; no bucket operations or guessed credential acquisition
-are performed by these scripts. A separately authorized end-to-end restore check
-must precede any claim that this S3 procedure works for the selected provider.
-
-## Verification and remaining acceptance
-
-```sh
-uv run --no-sync ruff check .
-uv run --no-sync ruff format --check .
-uv run --no-sync mypy
-uv run --no-sync pytest -ra
-```
-
-Set `TACIT_TEST_DATABASE_URL` only to a dedicated disposable PostgreSQL database to run concurrency/migration variants. Live Evon tests remain explicitly opt-in. The verified matrix used sanitized environments and temporary schemas; its disposable PostgreSQL container was removed afterward. Fixture providers do not establish live integration quality.
-
-Remaining user/external gates:
-
-- Native Windows/macOS installation, terminal behavior, Credential Manager/Keychain and microphone privacy prompts.
-- Real microphones/speakers, device refusal/unplugging, sample-rate support and playback.
-- Live Prisma short/long/incremental transcription, Timbre synthesis and measured credits; actual Evon quality and latency.
-- Stable production DNS/TLS and the deferred four-user demonstration. Codex CLI and laptop/ngrok signed repository-addition/removal acceptance are recorded below; Claude Code testing is waived at the user’s request, without a compatibility claim.
-- Human-authored 30-scenario evaluation with at least 10 held out, plus a bounded developer handoff study.
-- Production-shaped application recovery, deployed storage permissions, power-loss behavior and actual S3 acceptance if selected.
-
-Offline text teaching synchronization, two-account publication quorum and Arch VS Code selection have passed the operator-run checks recorded below. Native Windows/macOS acceptance and broader failure/deployment/quality gates remain separate. Team mappings/custom roles are implemented as described below; their two-account real-organization permission/revocation check has passed as recorded below. Snapshot export/lockfiles and opt-in remote MCP/OAuth are implemented as described below; live Codex remote OAuth discovery, pinned retrieval and server-side revocation have passed for the tested laptop/ngrok deployment.
-
-## Laptop HTTPS test endpoint
-
-The laptop backend was reached through `https://zodiac-bubbling-stereo.ngrok-free.dev` on 2026-10-31 17:19 UTC. HTTPS liveness/readiness returned 200 with PostgreSQL ready; unauthenticated repository access and unsigned webhooks returned 401. Incompatible HTTP and WebSocket version declarations returned 426 through the tunnel; unauthenticated voice WebSocket handshakes were rejected. Protocol version headers survived proxying. Genuine GitHub-signed delivery and an authenticated WebSocket upgrade are verified below. Evon is unconfigured. This verifies ngrok-managed HTTPS, not direct Caddy certificate issuance. The laptop API, database and ngrok process must remain running for this endpoint to work.
-
-GitHub delivery `a95843b0-d550-11f1-8da0-abc3bff532d0` (`installation_repositories.added`) reached the ngrok endpoint and returned HTTP 200 on 2026-10-31. Its verified receipt was persisted at `2026-10-31 17:29:45 UTC`; `tacit-voice-logging/webhook-probe` was recorded as enabled (`gh-1441094925`, workspace `gh-343680840`). This confirms a genuine GitHub-signed event passed through the HTTPS tunnel and was processed durably, without Evon.
-
-Authenticated laptop endpoint checks also passed: GitHub device login identified the human owner and discovered both organization repositories. Exact retrieval of the existing scheduler-demo snapshot returned `answered`, confirmed applicability, one decision, no warnings and zero STT/TTS/reasoning/token usage. An authenticated voice-upload WebSocket returned HTTP 101 and the correct empty-session acknowledgment; that probe session was cancelled afterward. No microphone bytes, provider calls or knowledge publications were used.
-
-Removal delivery `cb0b9d58-d551-11f1-923b-5b3869371059` was accepted with HTTP 200 and persisted at `2026-10-31 17:37:50 UTC`. The webhook disabled `webhook-probe` while `scheduler-demo` remained enabled. Subsequent authenticated scope checks require a fresh login because the previously saved Tacit credential expired; its 401 response is not evidence of repository-specific revocation. The existing API/database were restarted after a later shutdown; ngrok remained online.
-
-After fresh public-endpoint login, repository-specific removal checks passed: the owner credential remained valid, repository discovery listed only `scheduler-demo`, and direct `webhook-probe` head access returned 404. The original `scheduler-demo` snapshot `1985d0af-121a-4a84-aff0-c8a6b20c6608` was unchanged and retrieved with confirmed applicability, no warnings and zero provider/token usage. This completes the laptop/ngrok HTTPS, authenticated read/WebSocket and signed repository-addition/removal checks. Direct Caddy certificate issuance, native devices, live providers and production/S3 acceptance remain separate.
-
-On 2026-11-01, the second human account (`vanshjj`, `gh-139905374`) passed learner checks through the public HTTPS endpoint: discovery exposed only `scheduler-demo`; the shared published snapshot returned confirmed context with no warnings and zero provider/token usage. Teaching-draft creation, publication, voice-session creation and teaching-run creation all rejected empty-payload probes with 403. Reading the owner's private teaching draft also returned 403. The published snapshot remained unchanged, and no knowledge was published. This verifies the two-account owner/learner boundary; the four-user demonstration remains deferred.
-
-
-On 2026-11-01, user-supplied output from a real Codex CLI session confirmed the local Tacit MCP server connected with all six read-only tools. A repository-scoped delegated agent credential discovered workspace `gh-343680840` and only `tacit-voice-logging/scheduler-demo`. `get_context` retrieved the exact published snapshot `1985d0af-121a-4a84-aff0-c8a6b20c6608` at commit `4f44dd5e2a7f37325be9f9ab7aa541140029d9c8`; Codex correctly reported the expired-worker publication prohibition and cited decision `a7f72fa6-ba60-4ff3-87a7-0463d56f6d17` and revision `70e3726c-8631-4e64-8880-bd6cb14885e0`. Applicability was confirmed, with no warnings or truncation and zero Tacit STT/TTS/reasoning calls or provider tokens. No teaching/publication tool was exposed. This proves Codex discovery and exact cited retrieval, not live Evon reasoning, execution of every MCP tool, or Claude Code compatibility; Claude Code testing is waived at the user's request; it is not recorded as a test pass.
-
-
-## Human scenario and handoff evaluation
-
-Status: preparation only; no quality or productivity result is established. Local CSV templates are in `output/human-evaluation/`: 20 teaching scenarios, 10 held-out scenarios, and a handoff results sheet. These local artifacts are not required for installation. Scenario statements and expected outcomes must be written and reviewed by a human module author before additional teaching; blank template rows are not authored scenarios. Existing published knowledge may already influence this evaluation, so identify that prior exposure rather than describing the dataset as a clean baseline.
-
-The author records the scenario, facts, requested action, intended outcome, rationale and pinned source evidence. Include supported prohibitions, boundary cases, contradictory or missing facts, and cases where no definitive answer is justified. Keep the ten held-out scenarios and answer key out of teaching prompts and model-tuning/debugging; after using a case to guide fixes, retire it from the held-out set. Store answer keys privately and do not publish them as Tacit knowledge.
-
-Before each run, pin the repository commit and published snapshot. Report exact context retrieval separately from deterministic typed-rule evaluation and optional Evon synthesis. The currently tested scheduler statement has no typed rule (`rule: null`); retrieving its text does not prove deterministic scenario evaluation. A text-only or Codex interpretation is also not evidence of Evon answer quality. Live Evon quality evaluation remains pending while its server is unavailable. Record output, expected outcome, citation validity, unsupported definitive answers, warnings, latency and provider usage for each evaluated case. Report the sample size and individual failures.
-
-For handoff evaluation, define a bounded task and correctness rubric before timing. Prefer different participants with comparable experience or matched tasks with counterbalanced conditions; repeating the same task with the same person introduces learning bias. Compare source-only context with source plus Tacit context using the same code baseline, record time and correctness separately, and disclose participant count, task differences and prior exposure. No productivity gain is claimed before these measurements.
-
-
-## Synthetic scheduler demonstration
-
-`scheduler-demo` is an empty test repository, not an implemented scheduler. The operator agreed to use a proposed fictional publication policy to exercise Tacit. Local materials are in `output/scheduler-demo-evaluation/`: `proposed-specification.txt`, twenty development prompts, ten reserved prompts, separate answer keys, and review instructions. These materials are AI-authored. The human maintainer approved the specification on 2026-11-01; teaching, publication and evaluation remain pending. The ten reserved cases share an author with the specification and are not independently blind. The expired-lease rule has already been exposed in the existing snapshot. This demonstration does not fulfill the separate human-authored thirty-case benchmark or a real developer handoff study.
-
-The proposed policy permits job-result publication only with current attempt ownership, completed computation, a currently valid lease and no cancellation. Known disqualifying facts forbid publication; missing or conflicting facts prevent permission, and unspecified actions remain unknown. The human maintainer must approve the text before using the normal teaching/review/confirmation workflow. Answer keys must remain out of teaching and model evaluation prompts. Pin the actual source commit and newly published snapshot before testing. Codex interpretation, exact retrieval, typed rules and live Evon quality are separate measurements.
-
-
-On 2026-11-01, the human maintainer published the approved synthetic scheduler specification: decision `5ecd09f4-91cc-4840-bd48-bc5889b31888`, revision `23f0b137-c750-469d-9822-843eb1348edb`, snapshot `ff964f49-8174-4280-874a-4e27876a213b`, source commit `83c69e38ff7e26b5961a84d59ee26c43bd209de4`. Publication evidence was supplied by the operator. The specification is textual (`rule: null`). The local development evaluation prompt is pinned to this baseline; its twenty-case Codex interpretation run and ten reserved cases remain unexecuted. Earlier snapshot history is retained, so context warnings must be reported rather than silently discarded.
-
-
-The user-supplied Codex development response matched all twenty saved synthetic expected outcomes (20/20). Its cited decision/revision IDs matched the published baseline. Codex reported confirmed, complete retrieval and zero Tacit provider calls/tokens, while preserving the warning `Retained knowledge from other commits needs applicability review`. The full raw MCP payload was not supplied, so this records the supplied client response rather than independent wire capture. These same-author development cases demonstrate text retrieval and Codex interpretation, not independent general accuracy, typed-rule execution, or Evon quality. Ten reserved synthetic cases remain pending. Local outcome comparison: `output/scheduler-demo-evaluation/development-results.json`.
-
-
-The user-supplied Codex response for ten reserved synthetic cases matched all ten saved expected outcomes (10/10), citing the same published decision/revision. This run reused the earlier retrieved policy in the same conversation; it did not establish a fresh MCP retrieval or authorization check. Combined outcome agreement was 30/30 synthetic cases (20 development plus 10 reserved), not an independent blind benchmark. Some cases explicitly supplied derived facts such as lease validity, so they do not independently verify timestamp or ownership derivation. No Evon, typed-rule, actual scheduler, or real developer-handoff result is established. Local comparison: `output/scheduler-demo-evaluation/reserved-results.json`. Both synthetic case sets have now been exposed and must not be represented as unseen in later runs.
-
-
-## Raahi real-code handoff preparation
-
-The operator selected `nexxucc/raahi` as a simpler real-code exercise. Baseline: `2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd`, repository ID `gh-1406716088`. A fresh isolated checkout passed all six tests in `tests/test_crowd.py` after installing its declared development dependencies; no live transit feed or paid provider was used. Local preparation is in `output/raahi-handoff/`: a source-derived intent statement awaiting maintainer review, and a proposed internal-matcher task to report sorted unique candidate route IDs for ambiguous matches without changing API schemas or matching semantics. No Raahi knowledge has been taught by this preparation, and no feature change or handoff evaluation has run. A Codex-only task does not establish human productivity gains.
-
-
-The operator published Raahi matcher intent in snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81`, decision `411b198f-f9c5-4fd0-870d-c91168ab9968`, revision `c54f153a-bfda-473c-bb54-347bf0bf8af8`, pinned to source `2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd`. An isolated checkout and snapshot-pinned Codex task prompt are prepared under `output/raahi-handoff/`; execution and post-change review remain pending.
-
-
-Raahi Codex-assisted handoff verification completed on 2026-11-01. Independent review of the local diff confirmed the only implementation change adds `candidate_route_ids: sorted(close_routes)` to ambiguous internal matcher results; the existing candidate selection, status logic, thresholds and other result fields are unchanged. Only `app/matcher.py` and new `tests/test_matcher.py` are changed in the isolated checkout. A fresh combined run passed 16 tests (six crowd plus ten matcher cases) in 0.41 seconds; focused Ruff and `git diff --check` passed. User-supplied Codex evidence reported confirmed snapshot retrieval, correct citations, no warnings, zero Tacit provider usage and 84 seconds elapsed; that timing and MCP trace were not independently captured. This demonstrates a bounded real-code task using Tacit context, not a controlled human handoff/productivity study, HTTP exposure of the new internal field, live feeds, or Evon synthesis. Changes remain uncommitted and unpushed.
-
-
-## Live voice latency repair (2026-11-02)
-
-Live operator tests failed: a retained 55.6-second recording yielded only delayed previews and no final draft; a 20-second attempt produced no final transcript. Backend storage showed audio delivery falling behind capture. Additional attempts exposed startup timeouts and an empty orphan session consuming quota; the operator cancelled that orphan while preserving captured recordings. These runs do not establish live voice acceptance.
-
-Voice preflight now includes the authenticated user ID and current repository head so the CLI can reuse one response, with fallback for older servers. Duplicate initial capability/identity requests were removed, and progress messages distinguish access checks, session preparation and active capture. Initial source binding and fresh connection admission still happen before microphone capture; startup is not claimed to be instant. GitHub HTTP connections are pooled within each eligibility operation without caching access results or sharing cookies between operations.
-
-Live audio/ACK/preview handling checks local credential expiry, membership, roles, repository enablement and session state on each event instead of making external GitHub requests for every chunk. A session-scoped background task revalidates GitHub eligibility every five seconds with a five-second deadline; failure stops the stream. GitHub-only revocation therefore has a bounded polling/detection window, distinct from per-event local checks. Final transcript persistence still requires fresh external authorization. Provider calls are never automatically replayed. Safe logs report handshake success, audio progress, slow authorization and failure classes without raw provider payloads, keys or transcript text.
-
-Disposable PostgreSQL fixture verification of the live transcript and durable voice suites passed 64 tests, with 15 skips and one existing Starlette deprecation warning. Regression cases cover avoiding per-chunk external polling and stopping an idle stream after GitHub revocation, alongside existing logout/cancellation checks. Lint and targeted type checks passed. A new paid live attempt and measured time-to-capture/first-transcript/final-draft are still required; no live success is claimed.
-
-
-After the latency repair, the operator supplied a successful 19.9-second live Prisma run on Raahi: recording `da7e33dc-207a-41e2-b00a-68b16bd2eac5`, operation `11c1e12b-0fb5-4a17-a243-e6c52b31c965`, session `ba60048d-b9b2-49da-b4fd-8e8edebfd42d`, private draft `e6174ed5-a8b5-4db6-bcc0-f6bffe2ce839`. Two provisional segments appeared before capture ended and a third afterward; the final draft reported `capture_complete: true`, `transcription_complete: true`, three segments and `ready_for_review`. No publication occurred. The original transcript misrecognized route/search terminology and needs human correction before publication. This establishes short live microphone-to-draft and incremental display acceptance from supplied client output; precise startup/finalization latency, credits for this attempt, provider-side completeness beyond its reported state, pause/resume, and recordings longer than thirty seconds remain unverified.
-
-
-For the successful short live run, the operator reported noticeably improved responsiveness, approximately two seconds to the returned result, and a Prisma charge of 0.09 credits for 0.25 minutes. These are operator estimates/billing observations, not instrumented latency measurements; the CLI trace also contains a periodic waiting message. Provider-billed duration (15 seconds) differs from captured PCM duration (19.9 seconds) and is recorded separately without assuming a billing or audio-loss explanation.
-
-
-A subsequent fifty-second live attempt delivered five provisional segments and thirty-two durable chunks before stopping on `Invalid transcript segment`; long live acceptance remains failed. Audio transport was progressing during capture. Gnani's current realtime documentation explicitly discusses empty transcript text, but the adapter rejected all blank strings. Valid empty segments are now retained with their original index/ID and omitted from previews and joined prose; all-empty sessions still fail and malformed/conflicting segments remain rejected. Safe schema flags now distinguish index/ID/text/finality failures without logging content. The supplied failure did not identify its rejected field, so empty text is a plausible cause rather than a confirmed explanation of that specific event. Fixture verification passed seven provider tests, with twenty-eight PostgreSQL-dependent live variants skipped in this run; lint and targeted mypy passed. A further live attempt is required. Source: https://docs.gnani.ai/api/STT/stt-websocket
-
-
-The operator subsequently supplied matching client and API output for a successful 50.0-second live microphone run on 2026-11-02. Recording `3bdc7a43-a200-46b5-8bda-fc51a4ba6e88`, operation `c996c332-fa09-4b22-96c0-da91562fd4f2`, session `9e2033bb-67f5-4edf-8156-b3d4193b67ba`, private draft `540f9bf4-8715-4da6-9f9f-7a1b7bf6eea8`. Ten provisional segments appeared before capture ended and an eleventh afterward. API logs recorded all fifty durable chunks, fifty seconds forwarded to Prisma, capture finalization, and eleven complete segments; the draft reported both capture and transcription complete and remained unpublished. This establishes the tested long-live microphone/stream/preview/final-draft path, not arbitrary-duration reliability or word-perfect transcription. The transcript contains route/root spelling substitutions. The operator clarified that they actually spoke 'may remain ambiguous', so that phrase was transcribed faithfully and is not an ASR error. It differs from the scripted 'must remain ambiguous'; any change to the intended requirement needs human review before publication. No word-error rate was measured. This successful run contained no empty segments, so it does not independently prove empty-text validation caused the preceding failure. Exact latency and credits for this run, live pause/resume/cancellation/recovery, and broader provider quality remain separate checks.
-
-
-For the successful fifty-second run, the operator reported 0.25 Gnani credits for 0.75 billed minutes (45 seconds), distinct from the captured PCM duration of 50.0 seconds. Together with the successful short run (0.09 credits), successful-run charges total 0.34 credits. This excludes prior failed attempts and does not establish a general tariff or explain billed-versus-captured duration differences. Exact finalization latency for the long run has not been supplied.
-
-
-The operator authorized preparing a human correction of the successful long voice draft. Proposed text is local at `output/raahi-handoff/corrected-live-transcript.txt`; it restores route terminology and sentence boundaries, removes the standalone 'yes', and deliberately changes the spoken 'may remain ambiguous' to the intended 'must remain ambiguous'. The original 'may' was faithfully transcribed, so that edit is a human intent change, not an ASR error correction. The draft-reference correction path preserves the original transcript, audio hash, segments and source bindings without invoking a speech provider. Submission, review and publication acceptance of this correction remain pending.
-
-
-The operator supplied successful correction-draft evidence: corrected draft `c6471034-93f2-4d53-bc7b-1b964aad15eb`, operation `3c42abcd-088e-4fc6-a034-933787b2c0b8`, references original draft `540f9bf4-8715-4da6-9f9f-7a1b7bf6eea8`. The reviewed statement differs while `voice.original_transcript` retains the spoken 'may', `corrected` is true, and the original audio SHA-256 `71bd655473b55bff949a12d3c53c033acd52a05f482f0f866b469be46c9fa661`, fifty-second duration, session/voice-operation IDs, eleven original segments and both source blob bindings match the original supplied draft. Both completion flags are true. Status is `ready_for_review` with no published snapshot. This verifies human correction and evidence preservation from operator output; no new recording or STT request was required by this correction path. Publishing test narration is unnecessary because approved Raahi matcher intent is already published.
-
-
-The operator supplied a successful live pause/resume test: recording `2049f032-16c8-4234-93f8-ff95a18fc8d1`, operation `212372e2-2a0e-4e51-ae94-2a7cc980e477`, session `f1261714-550a-4245-8e31-e2e149026fd4`, private draft `198b2068-1d7f-48d7-a27b-289ffb1222ac`. The client acknowledged p/Enter pause and r/Enter resume; the final transcript contains the before/after phrases and excludes the specified paused sentinel phrase. It reports 16.8 captured seconds, three segments, both completion flags true and ready_for_review with no publication. This supports the tested short pause/resume flow from client output; raw paused audio exclusion, arbitrary pause length and provider reconnection behavior were not independently measured. Route/root homophone spelling remains a transcription-quality issue, not evidence of incorrect pronunciation. Credits for this attempt were not supplied.
-
-
-Live Ctrl+C cancellation was verified for recording `524681b3-7a7c-4e75-b9db-e55842de5595`, operation `a25f0b0f-dd24-46bc-b4ad-fc832ff27183`, backend session `84c35c9d-ee0f-4133-a46f-fc408bf0f6f4`. The client received a preview before cancelling and the recording disappeared from its local list. Independent read-only database checks found status cancelled, zero retained VoiceChunk rows, zero teaching drafts and zero saved transcripts for that operation; the session retains its metadata counters for ten received chunks. The old cancellation message incorrectly claimed no transcription had happened despite the preview. It now reports cancellation and, on successful live cleanup, warns that Prisma may already have processed audio and consumed credits. Twenty platform-audio tests passed after this wording fix. Cancellation does not undo provider processing or establish zero charges.
-
-
-Interrupted-upload recovery passed in an operator-driven test: stopping ngrok during non-live durable capture left recording `cbae5923-d182-4443-bef1-5b2a79fb59e6` recorded locally with thirty chunks/956800 PCM bytes (29.9 seconds), with the CLI reporting no transcription started. After restoring the tunnel, explicit `voice resume` returned private draft `8845152b-6b4c-46ab-96a0-72ab790151a9` without starting another capture. Voice operation `c75ad3ee-0216-479b-bd91-8277b0d287fc` and backend session `abb3930e-2699-42d5-ba6e-9018d0261303` matched the retained session; both completion flags were true and source bindings were preserved. This short recording used WAV transcription (`segments: []`), distinct from segmented live transcription. No publication occurred. This verifies the tested pre-transcription upload interruption/resume path from operator output, not recovery/rebilling behavior after an uncertain paid provider attempt. Credits and exact resume latency were not supplied.
-
-
-Initial live Timbre smoke test failed with `synthesis_failed` (503), operation `8b23725c-70ea-45f2-88ff-82e540ba6ca9`. No successful playback is established. Current Gnani documentation confirms the configured binary REST endpoint, Timbre v2.5, English Kaveri voice and mono PCM16/48kHz WAV request settings. The original adapter hid failure details, so redacted stage, exception class, upstream HTTP status and audio byte count logging was added; keys, text and provider response bodies remain excluded. Artifact/Timbre fixture checks passed 15 tests with 14 database-dependent skips. No automatic retry or operation-reservation reset was performed. A diagnostic live retry, potentially billable, is required to distinguish provider rejection, connectivity and WAV-validation failures.
-
-
-The diagnostic Timbre retry returned upstream HTTP 200 with 583724 audio bytes, then failed WAV validation; synthesis transport succeeded but playback remains unverified. The original response bytes/header were not retained, so neither header sizes nor output format can be established from that log. A fixture-reproduced compatibility change now finalizes canonical PCM WAV headers only when both RIFF and data lengths explicitly use the unknown-length 0xffffffff sentinel, preserving sample bytes; finite-length truncation and unsupported output formats remain rejected. Additional safe failure diagnostics include WAV channel count, width, rate, compression and declared frames. This is a tested compatibility improvement, not a confirmed explanation of that live failure. Combined voice-acceptance/artifact tests passed 29 with 20 database-dependent skips; targeted mypy and lint passed. A new provider attempt may incur another charge and must use a new explicitly chosen operation ID, retaining failed operation records.
-
-
-Live Timbre synthesis and authenticated artifact download subsequently succeeded: operation `de177999-094c-4c95-a6f2-7d36ac9d619d`, artifact `d0580197-a038-4025-98d1-11b5708f4086`, 568364 bytes, SHA-256 `921e8f97590cabbf9ebbd27ddf88a02bf8e7ac2815b434f66f592095dc25b042`, reported TTS calls 1. The WAV was saved locally and the operator ran `tacit audio play` without a reported error. Audible speaker output, perceived quality, cost and latency await operator confirmation. This tests the backend synthesis/artifact/download/local playback path, not the Evon-dependent clarification-question workflow.
-
-
-The operator confirmed the synthesized Timbre sentence was clearly audible through the speakers. Independent local inspection verified the downloaded artifact hash and a complete 5.92-second mono PCM16/48kHz WAV (284160 frames). The live synthesis/authenticated artifact download/local speaker playback smoke check therefore passed. This is a single short English/Kaveri example; synthesis credits and latency were not supplied, and full Evon-generated clarification-question playback remains unverified.
-
-
-For the successful Timbre playback operation, the operator reported a charge of 0.2 credits for 110 billed characters. This records the observed successful request only; charges from preceding failed WAV-validation attempts were not supplied and are not included. It is not a general pricing guarantee.
-
-
-## Post-voice full regression (2026-11-02)
-
-The operator ran the full current suite on Python 3.14.8 with a disposable PostgreSQL 17 container and inherited Tacit/Gnani/Evon/AWS variables cleared. Result: **576 passed, 28 skipped, no failures/errors**, 604 collected, 411.85 seconds. Twenty-two skips are SQLite variants requiring PostgreSQL locking/concurrency; their PostgreSQL counterparts ran. Six skips require explicit live Evon configuration. Three warnings are existing Starlette/TestClient deprecations (one httpx backend warning and two timeout-argument warnings). Ruff lint passed, 84 files passed formatting, and strict mypy passed 49 source files. The operator's initial whitespace command was blocked by a missing less pager; the follow-up uses `git --no-pager diff --check`. Test evidence: `/tmp/tacit-regression.Ceqy8q/pytest.log` and `pytest.xml`. This latest full result is for Python 3.14 only; earlier Python 3.12/3.13 runs predate these voice fixes. Live-provider and device evidence is recorded separately above.
-
-
-## Isolated Compose recovery acceptance (2026-11-02)
-
-An operator-run test built the committed deployment with locked non-development dependencies and migrated a separate PostgreSQL 17 source project. Using synthetic identities, mocked GitHub eligibility/source bindings, a published snapshot/revision and encrypted audio artifact, the actual recovery tooling created a database/object/key bundle and recovered its passphrase-protected key. Restore into a second empty Compose project succeeded. Service-layer checks matched snapshot/head and revision content, decrypted the restored credential, and recovered artifact bytes with the original hash. A repeat restore into the populated target was refused, and the same content checks passed afterward. Results are local at `output/recovery-check/results.json`. No live GitHub/Gnani/Evon request or production database restore was involved.
-
-This verifies real PostgreSQL dump/restore, local encrypted-volume transfer/activation, key recovery and the populated-target safety gate in the tested isolated setup. API and worker writers remained stopped; HTTP reauthentication, webhook replay, S3 recovery, crash/power-loss behavior and recovery of an actual populated production deployment were not exercised. After verification, both disposable recovery projects, their containers, networks and volumes were removed. The local recovery bundle, test configuration and result files remain private local artifacts; the working database was preserved. Compose used its classic builder successfully; Buildx was absent.
-
-
-## Latest supported-Python regression matrix (2026-11-02)
-
-The latest code passed all three supported Python versions with disposable PostgreSQL: Python 3.12.15 — **576 passed, 28 skipped, zero failures/errors** in 128.03 seconds; Python 3.13.17 — **576 passed, 28 skipped, zero failures/errors** in 127.44 seconds; Python 3.14.8 — **576 passed, 28 skipped, zero failures/errors** in the earlier 411.85-second run. Each collected 604 cases; these are repeated interpreter runs, not additional distinct scenarios. Each run had twenty-two SQLite-specific skips with PostgreSQL counterparts executed, six explicit live Evon skips, and three existing Starlette test-library deprecation warnings. Timing differences are observations, not a controlled interpreter benchmark.
-
-The 3.12/3.13 runs used isolated temporary environments and cleared inherited provider/application credentials. Logs and JUnit reports are retained under `/tmp/tacit-python-matrix.lzlNBi`; the disposable test container was removed. The cross-filesystem uv hardlink fallback was nonfatal and affects installation copying rather than test correctness. This completes the current automated Python matrix; native Windows/macOS device acceptance and the unavailable live Evon workflow remain separate.
-
-
-## Snapshot export and lockfiles
-
-Use a lockfile to select a stable published snapshot without repeatedly pasting repository, commit and snapshot IDs. A lock pins one repository and API URL, its workspace, source commit, snapshot, manifest and complete export SHA-256, with explicit format/API/schema/evaluator versions. Creating a lock from the current head resolves that head once; later head changes do not move an existing lock. To update, deliberately create and review a new lockfile under a new output name. Existing files are never overwritten.
-
-```bash
-# Set this to your trusted Tacit API; the lock never selects a server automatically.
-export TACIT_API_URL=https://zodiac-bubbling-stereo.ngrok-free.dev
-
-# Optional --snapshot selects an older immutable snapshot instead of current head.
-uv run --no-sync tacit snapshot lock --repo gh-1406716088 --output tacit.lock.json
-
-# Online reads still need your human login, or --agent with TACIT_AGENT_TOKEN.
-uv run --no-sync tacit context --lock tacit.lock.json --files app/matcher.py
-uv run --no-sync tacit ask "What should happen for ambiguous routes?" --lock tacit.lock.json
-uv run --no-sync tacit evaluate --scenario examples/scenario.json --lock tacit.lock.json
-
-# Download complete published content and verify it against the pinned digest.
-uv run --no-sync tacit snapshot export --lock tacit.lock.json --output snapshot.json
-uv run --no-sync tacit snapshot verify --lock tacit.lock.json --export snapshot.json
-
-# Explicit offline operations: no network, provider calls or credentials needed.
-uv run --no-sync tacit snapshot verify --lock tacit.lock.json --export snapshot.json --offline
-uv run --no-sync tacit context --lock tacit.lock.json --export snapshot.json --files app/matcher.py
-```
-
-The scenario file must describe a domain supported by the repository's published typed rules; using a lock does not create those rules or turn text knowledge into an executable policy. `ask` remains exact confirmed-statement retrieval unless `--reason` is explicitly requested, which may consume Evon resources. `context`, `ask` and `evaluate` preserve their existing explicit-ID forms; supplied IDs conflicting with a lock fail before credentials or reasoning requests are sent. Online commands require `TACIT_API_URL` to match the pinned API URL, and revalidate access and content instead of silently falling back to an export or a newer head. The lock does not automatically verify the local checkout's Git HEAD; its commit pins the retrieved knowledge, so check your checkout or supply an explicit `--commit` to detect a mismatch.
-
-Exports use the authenticated read-only `GET /v1/repos/{rid}/snapshots/{sid}/export` endpoint. They contain published decisions, rules, source bindings and evidence references, including retained members from older commits; private drafts, access tokens and raw audio are excluded. A manifest must be consistent, revisions sorted/unique and the entire canonical payload at most 4 MB with at most 10,000 decisions. Oversized or inconsistent snapshots fail rather than producing a partial export. Agent reads remain read-only and scoped. Existing wire protocol versions are unchanged because this is an additive endpoint and CLI feature.
-
-Treat exports as private repository data. Files are created exclusively with the platform's private storage permissions and symlink-safe writer; choose deliberately before sharing or committing any export. Lockfiles contain identifiers and a server URL, not credentials, but can still disclose private repository metadata. JSON duplicates, incompatible versions, scope/content changes and output collisions are rejected. Offline context preserves file filtering, pagination, evidence, zero provider usage and warnings for older-commit knowledge. Its applicability only compares the pinned source commit with exported decisions; it does not establish current authorization, revocation status, local code applicability or server authenticity. Content hashes detect changes relative to a trusted lock; they are not signatures and an attacker able to replace both files can forge a self-consistent pair. No snapshot import, offline teaching sync or remote MCP transport is added.
-
-
-Snapshot/export verification: the full PostgreSQL-backed regression run passed **600 tests with 28 explained skips** on each of Python 3.12.15, 3.13.17 and 3.14.8. After final contract cleanup and two additional boundary cases, the focused snapshot/compatibility/CLI-MCP suite passed **102 tests with no skips** on each interpreter (26 snapshot feature cases per run). Ruff lint, formatting and strict mypy passed (51 source files). Contracts and CLI wheel/sdist builds succeeded and include the new modules. Tests cover online lock/export/context/question flows, unchanged explicit-ID commands through regression coverage, head movement, private-draft exclusion, scoped agent access/revocation, offline zero-network reads, retained-commit warnings, pagination, content/scope/version tampering, duplicate JSON keys, API-origin mismatch, size limits and safe output creation. All provider responses were fixtures; no Gnani/Evon requests, knowledge publications to real repositories or production database changes were made. The isolated PostgreSQL test container was removed. Logs/JUnit reports and source checksums are retained in `/tmp/tacit-snapshot-regression/`. A running backend must be restarted or redeployed to expose the new export endpoint; hosted/live user acceptance has not been performed.
-
-
-Hosted snapshot/lock acceptance subsequently passed on the ngrok-backed deployment. The operator created `tacit.lock.json` for Raahi snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81`, retrieved confirmed complete context with no warnings and zero provider usage, and downloaded `snapshot.json`. Independent CLI verification matched the downloaded content against the lock both offline and through fresh authenticated online access. An offline file-scoped read preserved revision `c54f153a-bfda-473c-bb54-347bf0bf8af8` and zero usage; both local files have mode 0600. This verifies the tested live pin/read/export/verification path without paid providers. The local knowledge export and lock are test artifacts and were not added to version control. Offline integrity remains distinct from current access or signed authenticity.
-
-### Raahi lockfile development pilot
-
-On 2026-11-02, a bounded Codex-assisted pilot used the published Raahi snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81` and source commit `2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd` to review the existing internal matcher change. Lock-based retrieval preserved decision `411b198f-f9c5-4fd0-870d-c91168ab9968` and revision `c54f153a-bfda-473c-bb54-347bf0bf8af8`. Fresh authenticated online verification passed. Offline context also succeeded with an unreachable API and provider credentials removed; modified policy text and an explicitly conflicting commit were rejected. All context usage counters were zero.
-
-The isolated Raahi checkout gained seven regression cases for exact distance thresholds, exact ambiguity margins, comparisons before display rounding, and ambiguity measured relative to the best segment. Its existing `candidate_route_ids` implementation was preserved. The full local Raahi suite passed: **60 tests on Python 3.13.17**, with focused Ruff and diff checks passing. Six deliberate mutations in disposable source copies were all detected, covering equality, premature rounding, an extra absolute candidate-distance cap, and omission of candidate IDs. Pilot receipts and mutation logs remain local in `output/raahi-lock-pilot/`; the uncommitted Raahi work remains in `output/raahi-handoff/checkout/`.
-
-This demonstrates using pinned knowledge during a bounded development/review task. The lock does not attest to dirty working-tree bytes or automatically check local Git HEAD. The policy was source-derived and the code was previously exposed, so this is not an independent human handoff or productivity comparison. No live feeds, paid providers, publication, commits or pushes were performed during this pilot. Remote MCP/OAuth was the next task after this pilot; its implementation is described below.
-
-## Remote MCP with OAuth
-
-Remote MCP is optional. Existing `tacit-mcp` stdio configuration continues to use `TACIT_AGENT_TOKEN`. The HTTP endpoint exposes exactly the same six tools at `/mcp`, using Streamable HTTP with stateless requests. OAuth tokens are audience-bound to that exact endpoint and cannot authenticate to the ordinary API; human/CLI/stdio credentials cannot authenticate to `/mcp`. GitHub eligibility, parent credential expiry/revocation, local roles and selected repository access are checked on subsequent requests. Nothing changes in an existing deployment until remote MCP is explicitly configured.
-
-To enable it on a deployment with PostgreSQL and GitHub authentication already configured:
-
-1. Install the frozen dependencies with `uv sync --frozen` (retain `--extra audio` if this checkout also provides microphone/playback commands), then run `uv run --no-sync alembic upgrade head` with that deployment's `TACIT_DATABASE_URL`. Migration `0007` creates durable OAuth grant storage. Back up an existing database before deployment. Do not run migrations against a different development/test database by accident.
-2. Set `TACIT_MCP_PUBLIC_URL` to the canonical public **origin**, such as `https://tacit.example.com` (no `/mcp` suffix, path, query, credentials or fragment). HTTP is allowed only for loopback development. The reverse proxy must preserve the public Host header and route `/mcp`, `/authorize`, `/token`, `/revoke`, `/oauth/consent`, and `/.well-known/*` to Tacit. Do not cache OAuth or authenticated responses.
-3. Register the client in `TACIT_MCP_CLIENTS`, using its exact callback URL. Example shell assignment: `export TACIT_MCP_CLIENTS='{"my-editor":{"name":"My editor","redirect_uris":["http://127.0.0.1:8345/callback"]}}'`. This is a **public** client with client ID `my-editor`, no client secret, authorization-code grant, and mandatory S256 PKCE. The callback here is an example; use the URL your actual client reports. Redirects must be HTTPS except for loopback callbacks. Dynamic client registration and client metadata URL fetching are intentionally unavailable; clients must support a pre-registered client ID.
-4. Restart the API, check `/health/ready`, and configure the MCP client for `<public-origin>/mcp` with the registered client ID and scope `tacit:read`. Clients must send the exact resource URI `<public-origin>/mcp` at authorization and token exchange. Discovery endpoints advertise the authorization server, PKCE support and protected resource. Native clients normally send no Origin header. For a browser-based MCP client, add its exact trusted origin to the JSON array `TACIT_MCP_ALLOWED_ORIGINS`; arbitrary origins and Host headers are rejected.
-5. In the opened Tacit consent page, sign in through GitHub's device page, return to Tacit, select repositories and click **Allow selected repositories**. No repositories are preselected. The browser keeps the human Tacit credential in page memory only; consent requires a same-origin request and browser-bound HttpOnly cookie. Client credentials never contain the GitHub provider token or the internal delegated credential.
-
-Authorization requests expire in ten minutes; codes expire within two minutes and are exchanged once, atomically. Access expires within one hour, bounded by the human sign-in lifetime. No refresh tokens are issued: reauthorize when needed. The client may revoke using `POST /revoke` with form fields `client_id` and `token`; revocation also disables the underlying delegation. Changing/removing the public origin or registered client invalidates its existing remote tokens. Only published repository knowledge is exposed; teaching/publication tools are absent. Explicit `ask_repository(reason=true, operation_id=...)` remains an opt-in model call and may consume resources.
-
-Grant records retain hashes of OAuth secrets and encrypted internal delegation, using the existing stable encryption key. Expired OAuth records are pruned when a new authorization begins. The access service retains its usual credential/audit lifecycle. Keep the database and encryption key in the existing private recovery process. A lockfile or snapshot export does not grant OAuth access.
-
-Local automated acceptance covers OAuth discovery and consent, all six tool reads against synthetic published knowledge, token audience separation, PKCE/redirect/state/resource checks, code replay, repository isolation, logout/GitHub/revocation/expiry, and an actual loopback Uvicorn connection using the MCP SDK client. These use fixture GitHub responses without paid providers. The operator subsequently completed the live Codex OAuth flow and supplied successful repository-scoped discovery and pinned retrieval output, recorded below. Server-side live revocation subsequently passed as recorded below. The original implementation did not automatically reconfigure the live deployment; the agent later restored the existing API/ngrok setup for the authorized revocation check.
-
-Automated verification on 2026-11-03: the full Python 3.14.8 project suite passed **684 tests, 30 skipped**, with the three existing Starlette deprecation warnings. The skips comprise six opt-in live Evon cases and 24 SQLite-only omissions whose PostgreSQL counterparts ran. A focused remote-MCP/CLI/compatibility/migration suite passed **160 tests, 2 skipped** on each of Python 3.12.15, 3.13.17 and 3.14.8; after the final public-client metadata adjustment, the complete remote MCP module was checked again on 3.12 (**82 passed, 2 skipped**). The new PostgreSQL-only cases exercise single-use code exchange and concurrent users with separate repository scopes. The socket test covers both an explicitly supplied OAuth token and automatic OAuth discovery/exchange with the official SDK client and fixture browser-consent handler. Live Codex OAuth read acceptance subsequently passed as recorded below; server-side live revocation subsequently passed as recorded below.
-
-Ruff, formatting, strict mypy (53 source modules), frozen-lock consistency, JavaScript syntax, diff checks, and API/MCP wheel and source builds passed. Only README was updated among Markdown source documents, and the AST code graph was refreshed. Logs and built artifacts are local in `/tmp/tacit-remote-mcp-regression/`. Automated tests used a separate disposable PostgreSQL container; that test run did not migrate or reconfigure the running application database or deployment. The operator subsequently enabled the live deployment for the acceptance check below.
-
-
-### Live remote MCP/OAuth progress — 2026-11-03
-
-The operator completed the Codex remote OAuth setup against `https://zodiac-bubbling-stereo.ngrok-free.dev/mcp` and supplied the resulting MCP read output. Mark the **live remote OAuth discovery and pinned-read path as passed** on this operator-supplied evidence; the implementation agent did not independently capture the browser consent or MCP trace.
-
-- Accessible scope contained only workspace `gh-149251890` and repository `gh-1406716088` (`nexxucc/raahi`), consistent with the selected repository delegation.
-- Context retrieved snapshot `4eb0ab8f-669d-4a63-8af3-cadc11441b81` at source commit `2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd` for `app/matcher.py` and `tests/test_crowd.py`.
-- Returned provenance matched decision `411b198f-f9c5-4fd0-870d-c91168ab9968` and revision `c54f153a-bfda-473c-bb54-347bf0bf8af8`. Applicability was `confirmed`, status was `answered`, warnings were empty and retrieval was not truncated.
-- The returned route-hint restriction, distance/equality thresholds, ambiguity requirements and vehicle/direction limits matched the published statement. Its source-derived qualification was preserved. `answer_kind: none` represents retrieved statements, not provider synthesis.
-- All reported reasoning, STT, TTS and input/output token counters were zero. The operator reported no modification or publication.
-
-**Remote MCP live acceptance:** complete for the tested Codex/laptop/ngrok setup after the server-side revocation check below. Automated expiry, logout, audience separation and concurrent-user isolation checks remain distinct from live operator evidence; this acceptance does not claim every client, native platform or production deployment was tested.
-
-**Subsequent implementation:** GitHub team-to-role mappings and custom roles were implemented next; see their section below. Editor source selection was implemented next as described below; multi-maintainer approval quorum is implemented below, while offline teaching synchronization remains later implementation work. Native platform and other external acceptance gates above remain separate; this update does not mark the entire project finished.
-
-
-### Live remote OAuth revocation — 2026-11-03
-
-The agent restored the existing local API and ngrok processes using the existing database, stable encryption key, public origin and registered Codex callback. No configuration file or database schema was changed for this check. The previous remote token had expired, so the operator completed a fresh Codex/GitHub login and selected only Raahi. The agent then performed the following check directly through the public HTTPS endpoint using that saved `tacit-remote` OAuth credential:
-
-| Check | Observed result |
-|---|---|
-| Pinned Raahi `get_context` before revocation | HTTP 200; exact snapshot/revision, confirmed applicability, complete retrieval and zero provider usage |
-| `POST /revoke` with client ID `tacit-codex` | HTTP 200 |
-| First identical-context read with the same token | HTTP 401 with OAuth protected-resource challenge |
-| Second identical-context read with the same token | HTTP 401 with OAuth protected-resource challenge |
-
-The token's recorded expiry was still in the future after the failures, distinguishing revocation from expiry. The check used raw HTTP with no automatic OAuth refresh or sign-in. No credential was printed or saved in the receipt, and no repository knowledge was modified or published. The separate CLI login was not changed. Safe local evidence: `output/remote-mcp-revocation/result-20261103T040208Z.json`; the local helper is `output/remote-mcp-revocation/check.py`. These local artifacts are not part of the committed source.
-
-Mark the **live remote MCP/OAuth read-and-revocation acceptance complete for this tested setup**. The tested Codex connection is intentionally left revoked; authenticate `tacit-remote` again before using it. The restored API and ngrok remain running for further work. GitHub team-to-role mappings and custom roles were the next task and are now implemented below; the other external acceptance gates remain unchanged.
-
-## GitHub team mappings and custom roles
-
-Workspace administrators can define named content roles and map GitHub organization teams to repository-scoped or workspace-wide content roles. These are additive grants: removing a team grant does not remove a separate direct grant. Current GitHub repository visibility, active membership, enabled installation/repository state, and delegated-token scope remain mandatory. Agents remain read-only even when their human's custom/team role resolves to maintainer.
-
-Custom roles support two explicit permissions:
-
-| Permission | Capability |
-|---|---|
-| `knowledge.read` | Read confirmed knowledge/history, ask questions and evaluate scenarios |
-| `knowledge.write` | Human maintainer capabilities, including teaching, voice, correction, draft review and publication; requires `knowledge.read` |
-
-Custom roles do not grant workspace administration. Team mappings can target the built-in `learner` or `maintainer` content role, or one custom role. Built-in administrator assignment and last-administrator protection are unchanged. Existing learners keep their baseline read access unless that separate grant is explicitly revoked; a team mapping cannot act as a deny rule. A user granted `knowledge.write` is explicitly granted maintainer-equivalent content authority, while an administrator-only role still cannot publish knowledge.
-
-Apply migration `0008` before restarting the API/worker with this code. No existing built-in role assignments are rewritten. The following example uses the existing test organization/repository; run it only as a human workspace administrator after creating the intended team in GitHub:
-
-```bash
-cd /home/vansh/Tacit
-uv run --env-file .env --no-sync alembic upgrade head
-# Restart the API/worker with the normal deployment configuration before continuing.
-
-export TACIT_API_URL=https://zodiac-bubbling-stereo.ngrok-free.dev
-TACIT_WORKSPACE=gh-343680840
-TACIT_REPOSITORY=gh-1422572999
-
-# Human sign-in, if the current CLI credential has expired.
-uv run --no-sync tacit login
-
-# Create a named maintainer-equivalent content role.
-uv run --no-sync tacit custom-roles put reviewers \
-  --workspace "$TACIT_WORKSPACE" \
-  --permission knowledge.read --permission knowledge.write \
-  --expected-version 0 --description "Human repository knowledge maintainers"
-
-# Map an existing GitHub team whose slug is knowledge-maintainers.
-uv run --no-sync tacit team-roles add knowledge-maintainers \
-  --workspace "$TACIT_WORKSPACE" --custom-role reviewers \
-  --repo "$TACIT_REPOSITORY"
-
-uv run --no-sync tacit custom-roles list --workspace "$TACIT_WORKSPACE"
-uv run --no-sync tacit custom-roles assignments --workspace "$TACIT_WORKSPACE"
-uv run --no-sync tacit team-roles list --workspace "$TACIT_WORKSPACE"
-uv run --no-sync tacit team-roles effective --workspace "$TACIT_WORKSPACE"
-```
-
-Individual custom-role assignment uses `tacit custom-roles grant USER_ID ROLE_ID --workspace WORKSPACE_ID --repo REPOSITORY_ID`; `custom-roles revoke` uses the same arguments. Omitting `--repo` makes an assignment or mapping workspace-wide, still restricted to currently accessible enabled repositories. `team-roles add --role learner` or `--role maintainer` targets a built-in content role instead of `--custom-role`. Remove a mapping with `team-roles remove MAPPING_ID --workspace WORKSPACE_ID`, using the ID from `team-roles list`.
-
-Role edits require the current `--expected-version`; creation requires zero. Stale edits/deletes return a conflict. A role in use cannot be deleted until its assignments and mappings are removed. `custom-roles delete ROLE_ID --workspace WORKSPACE_ID --expected-version VERSION` retires that ID permanently, preventing delayed requests from affecting a recreated role. Active roles are limited to 100, individual custom assignments to 1,000 and team mappings to 20 per workspace. Effective authentication bounds distinct team checks to 64 across its eligible scopes and fails closed if that budget is exceeded.
-
-GitHub team creation and membership changes remain GitHub operations; Tacit never modifies them. The GitHub App needs organization **Members: read** permission. Mapping creation resolves the selected team slug to its numeric team ID and validates its organization ID. Runtime checks use the numeric organization/team membership endpoint and the authenticated user's freshly verified login/ID, preserving identity across renames and preventing a recreated slug from inheriting an old mapping. Only active membership grants a role; pending/absent memberships do not. Each distinct mapped team is checked once per principal evaluation, without a cross-request team-membership cache. A membership verification error fails content authorization closed; built-in administrator policy-management routes can still remove a broken mapping without requiring that team's API, while retaining ordinary GitHub eligibility and local administrator checks.
-
-Publication and other local write checks reload custom permissions and mapping existence under the workspace lock. Mapping removal and permission downgrades therefore stop stale local grants. External team membership is refreshed on HTTP authentication, within the existing live-audio background refresh interval/deadline, and at the durable-upload reauthentication interval. Local audio checks do not make a GitHub team request per chunk. These transport windows are distinct from immediate local policy revocation. Configuration changes are audited; derived team grants are never copied into permanent individual role rows.
-
-The administrative API adds `/v1/workspaces/{wid}/custom-roles`, `/custom-role-assignments` and `/team-role-mappings`, with scoped update/revoke/delete routes. `/effective-access` reports the authenticated user's current normalized grants and source provenance. MCP continues to expose exactly six read-only tools; no policy-management tool was added. Existing role and membership commands remain supported.
-
-Implementation and automated verification are described below. Live team enrollment/removal was a separate operator acceptance gate and subsequently passed as recorded below. No live organization policy, membership, repository permissions or database schema was changed during automated development; migration and temporary Tacit policy changes were performed later during the authorized live check.
-
-Automated verification on 2026-11-03 passed the full Python 3.14.8 regression suite: **753 passed, 32 skipped**, with the three existing Starlette deprecation warnings. After adding the final administrator-budget recovery cases, the focused team/custom-role and migration suite passed **73 tests, 2 skipped** on each of Python 3.12.15, 3.13.17 and 3.14.8. The two focused skips are SQLite concurrency/socket cases whose PostgreSQL counterparts ran; the full-suite skips also include the six opt-in live Evon cases. The full run collected 785 cases before the final two feature cases were added; this distinction explains the subsequent collection-count increase.
-
-Coverage includes human custom-role teaching/publication, read-only custom roles without a built-in content grant, agent write refusal, tenant/repository isolation, stale versions and retired role IDs, pending/removed/recreated teams, rename-safe numeric identity, malformed/provider-failure handling, direct-grant preservation, one membership lookup per distinct team, last-administrator protection, concurrent policy updates and duplicate mapping requests, stale-principal rejection, revocation during an open durable voice upload, safe cleanup after suspension/repository disablement, and administrator recovery from broken or over-budget mappings. CLI commands and composite database constraints are exercised. These are fixtures and local PostgreSQL/socket checks, not a live GitHub team demonstration.
-
-Ruff, formatting, strict mypy (55 source modules), frozen-lock consistency, diff checks, and API/CLI/contracts/domain wheel and source builds passed. The wheels include the new role modules, and the code graph was refreshed. Logs and JUnit reports are local in `/tmp/tacit-team-role-regression/`; a safe source-hash/result receipt is retained in `output/team-role-check/results.json`. The disposable PostgreSQL test container was removed. At the end of automated development, migration `0008` had not yet been applied to the real application database and no live GitHub team or role policy had been changed. Live acceptance preparation subsequently applied the migration, as recorded below; the two-account live permission/revocation check subsequently passed as recorded below. Changes remain uncommitted; only README was edited among Markdown source documents during this implementation.
-
-
-### Live team-role acceptance preparation — 2026-11-03
-
-A private compressed backup of the running application database was created and its archive listing validated before migration (1,358,841 bytes). Migration `0008` was then applied and the API restarted with the existing stable encryption key and public MCP configuration. Hash comparison confirmed the five published snapshots, five revisions, three repository heads and seven existing direct role assignments were unchanged. The backup and safe migration receipt remain local under `output/team-role-live/`; they are not source artifacts to commit.
-
-Preflight confirmed that `vanshjj` is an active organization member with only the learner content grant, and that the organization already gives members read access to repositories. This allows a team-write revocation check to preserve independent repository read access. No existing role grant is to be removed for the test. The available GitHub CLI credential has read-only organization scope, so the operator must create the disposable `tacit-role-check` team and manage its test membership through GitHub. The Tacit CLI credential also needs a fresh human login.
-
-At preparation time, live team/custom-role behavior was not yet accepted. The prepared two-account check was designed to verify learner denial, a team-mapped custom writer grant, an explicit permission downgrade, local mapping removal, agent write/admin refusal, cross-workspace denial, and GitHub team-membership removal while retaining repository read access. Teaching probes deliberately use invalid bodies to distinguish permission denial (403) from authorized request validation (422); no draft or knowledge was to be created or published. This positive permission probe does not constitute a live publication test. Temporary mappings and role authority were to be removed afterward, preserving existing direct grants and the published head. The completed results follow.
-
-
-### Live team/custom-role permission acceptance — 2026-11-03
-
-The two-account check passed against the ngrok-backed deployment using administrator `nexxucc` (`gh-149251890`) and learner `vanshjj` (`gh-139905374`) in `tacit-voice-logging`. The operator created GitHub team `tacit-role-check` (numeric ID `20479644`), added the learner and selected Read access only to `scheduler-demo`. Tacit configuration was tested only for repository `gh-1422572999`.
-
-| Check | Observed result |
-|---|---|
-| Learner before mapping | Effective maintainer authority absent; teaching probe HTTP 403; pinned read HTTP 200 |
-| Team mapped to the custom read/write role | Effective maintainer authority present; invalid teaching probe HTTP 422; pinned read HTTP 200 |
-| Custom role downgraded to read only | Teaching probe HTTP 403; repository read retained |
-| Custom write permission restored | Effective maintainer authority restored; invalid teaching probe HTTP 422 |
-| Local mapping removed while GitHub membership remained active | Teaching probe HTTP 403 |
-| Scoped agent acting for the promoted learner | Teaching and policy-administration requests both HTTP 403 |
-| Mapping attempted with another workspace's repository | HTTP 404 |
-| Operator removed learner from the GitHub team, keeping organization membership | GitHub team membership HTTP 404; effective maintainer authority absent; teaching probe HTTP 403; pinned read HTTP 200 |
-
-All context reads used snapshot `ff964f49-8174-4280-874a-4e27876a213b` and reported zero provider/token usage. The positive teaching probes deliberately supplied invalid bodies, so HTTP 422 establishes passage through the maintainer permission gate alongside the effective-grant result; it does **not** establish live draft creation or publication. No knowledge was created, modified or published by this check.
-
-Cleanup removed both temporary mappings, retired custom role `live-reviewers-20261103054355`, revoked the temporary learner/agent credentials, and restored the owner CLI login. Cleanup reported no errors. Independent database hash comparison confirmed that all published snapshots, revisions, heads and seven pre-existing direct role assignments were unchanged. The operator-created GitHub test team remains available, with the learner removed and no Tacit mapping. Private backup and safe receipts remain local under `output/team-role-live/`, including `result.json`; do not commit these operational artifacts.
-
-Mark the **two-account live team/custom-role permission and revocation acceptance passed for this setup**. Real custom-role publication remains covered by fixture tests rather than this live permission probe. The four-user demonstration and other native-platform/provider/production acceptance gates remain separate. Editor source-file/symbol selection is implemented below. Approval quorum is implemented below. Offline teaching synchronization remains the next implementation task.
-
-
-### Editor source selections — 2026-11-03
-
-The local VS Code adapter in `editors/vscode/` exports the active file, one contiguous selection, or a symbol supplied by the editor's language provider. It discovers the active file's Git checkout independently of workspace-folder order, prompts for a full source commit, and delegates validation/private-file creation to the installed Tacit CLI. No API credential, upload, microphone capture, model request or publication is involved in exporting context.
-
-Build and install the local extension (Python standard library only; no npm dependencies):
-
-```bash
-cd /home/vansh/Tacit
-mkdir -p output/editor
-uv run --no-sync python scripts/package_editor.py output/editor/tacit-source-selection.vsix
-code --install-extension output/editor/tacit-source-selection.vsix
-```
-
-The packager refuses to replace an existing archive. For a rebuild choose a fresh output filename. This is a local development extension, not a Marketplace release. In VS Code user settings, set `tacit.cliPath` to the installed executable, for example `/home/vansh/Tacit/.venv/bin/tacit` on this Arch checkout. The value is an executable path, not `uv run tacit` or another shell command. On Windows use the installed `tacit.exe` path. Workspace Trust is required; virtual documents and unsaved buffers are rejected. In remote VS Code sessions the executable and files must exist on the extension's workspace host.
-
-Open a saved UTF-8 source file, then choose **Tacit: Export Active File Context**, **Tacit: Export Selected Lines Context**, or **Tacit: Export Symbol Context** from the command palette. The symbol picker requires a document-symbol provider for that language. Use a pushed, full 40-character SHA and save the exported JSON to a private local location outside version control. The adapter does not prove a commit has been pushed; the existing teaching API checks authoritative GitHub source access. Files are limited to 64 KiB and selections to 400 lines. Large files require a separate workflow; selecting fewer lines does not bypass the 64 KiB file limit.
-
-The equivalent editor-independent command is:
-
-```bash
-tacit editor capture --root /path/to/checkout --commit FULL_40_CHARACTER_SHA \
-  --file app/matcher.py --start-line 10 --end-line 35 --symbol match_route \
-  --output /private/path/editor-context.json
-```
-
-Use the versioned export with grounded teaching, supplying the same commit and file scope:
-
-```bash
-tacit teaching extract --repo REPOSITORY_ID --commit FULL_40_CHARACTER_SHA \
-  --file app/matcher.py --source-root /path/to/checkout \
-  --editor-context /private/path/editor-context.json --text-file /private/path/intent.txt
-```
-
-`--editor-context` requires `--source-root` and cannot be combined with `--selections-file`. Import checks the exact commit, file scope, current disk hashes and dirty-file evidence before requesting the API. Re-export if the source changes. The existing human confirmation still controls extraction, followed by the existing clarification/review/draft/confirm workflow for publication. The JSON is local selection metadata, not a signed assertion or proof of symbol semantics. Dirty hashes identify local differences; local bytes and symbol names never replace verified commit content. Review line ranges against the pinned commit when the working file differs. The legacy `--selections-file` format remains available.
-
-Verification: 16 focused Python tests passed; 12 Node adapter tests passed, including real CLI export; the VSIX installed and appeared in an isolated VS Code extension inventory. Tests cover source changes, commit/file mismatch, dirty hashes, escaped symlinks, root selection, bounds, exclusive output creation, shell-argument safety, symbol/range conversion, cancelled dialogs, untrusted workspaces and unsaved/external edits. A broader relevant Python regression run passed 122 tests with 48 conditional skips (PostgreSQL-only variants were not enabled for this focused run) and one existing Starlette warning. Ruff, formatting, strict mypy and diff checks passed; the AST graph was refreshed. The operator subsequently confirmed all three VS Code commands and the unsaved-edit, saved-dirty-file, overwrite, empty-selection and cancellation checks on Arch. The older-context import also returned the expected changed-file rejection. This marks the supplied Arch editor manual acceptance passed; native Windows/macOS checks remain pending. No paid provider request or knowledge publication was used. Run `uv run --no-sync pytest tests/test_editor_context.py` and `node --test editors/vscode/extension.test.js` to repeat these checks (the real CLI Node test uses this checkout's `.venv/bin/tacit` on Arch).
-
-
-### Multi-maintainer publication quorum — 2026-11-03
-
-Repositories may require one to five distinct current human maintainers for publication. The default is **one**, preserving ordinary human confirmation. The final confirmer counts once; other counted people must have explicitly approved that exact draft. The author may participate, but repeated approval, multiple credentials for the same person, and approving one's own draft do not create additional people. Workspace administration alone grants neither approval nor publication permission. Maintainer-equivalent custom/team roles are eligible; agents cannot approve, withdraw approvals or publish.
-
-Publication policy is repository-scoped and managed only by explicit human workspace administrators. Updates require the current policy version. Every update, including a change back to an earlier threshold, increments the version and invalidates previous approvals for future publications. An administrator can explicitly lower the threshold; this is audited policy administration, not a restriction that requires the existing publication quorum. Published snapshots remain immutable.
-
-An approval binds a human ID and the approving human credential's hash to the immutable draft digest, its bound base snapshot and the policy version. No raw credential is stored in the approval or exposed in status responses. Current GitHub eligibility, repository access, team membership and normalized content authority are rechecked before publication; credential expiry/revocation, local permissions, mapping existence and current policy are checked again under the shared publication workspace lock. Approval withdrawal and policy/permission changes serialize with publication. External-provider verification precedes the lock; external changes that occur after that verification are subject to the same unavoidable observation window as ordinary GitHub-backed publication.
-
-A non-confirmer approval remains bound to its approving credential. If that credential expires or is revoked, that person must sign in and approve again. Approval status lists **recorded** reviews, not a promise that quorum is currently satisfied. Read-only knowledge queries and the six MCP tools do not expose approval or publication actions. Up to twenty distinct recorded reviewers are allowed per draft; if stale reviews exhaust that bound, prepare and review a new draft. Fresh eligibility checks stop once enough additional eligible reviewers have been found; the final locked check may still require a retry if local authority changes meanwhile.
-
-API endpoints:
-
-- `GET/PUT /v1/repos/{repository_id}/publication-policy`: human administrator policy inspection/update, with `required_maintainers` and `expected_version` on PUT.
-- `GET/POST/DELETE /v1/repos/{repository_id}/teaching-sessions/{draft_id}/approvals`: maintainer inspection, exact-review approval, or withdrawal of the caller's own approval. POST includes `policy_version`, `review_digest` and `expected_snapshot_id`.
-- Existing `POST .../publications` still requires explicit human confirmation, matching draft/base and a unique confirmation operation ID. Insufficient current approvals return HTTP 409 `quorum_required` without changing knowledge. Receipt retries preserve the original result; approval checks do not republish a draft.
-
-Migration `0009` adds `publication_policies` and `draft_approvals` with composite repository/draft foreign keys, user/credential foreign keys and policy bounds. Apply it with writers stopped and a verified private backup before starting this API against an existing database. This development task tests migrations in disposable databases; it does not migrate the running working deployment automatically. Do not downgrade away approval tables in a production deployment as a way to bypass quorum.
-
-Human-operated CLI flow after migration and API restart (replace the placeholders with a disposable test repository and reviewed draft):
-
-```bash
-# Human administrator: inspect policy; an unconfigured repository reports version 0.
-uv run --no-sync tacit approvals policy --repo REPOSITORY_ID
-uv run --no-sync tacit approvals set-policy --repo REPOSITORY_ID \
-  --required 2 --expected-version 0
-
-# First human maintainer creates a source-bound draft using the existing teach workflow.
-# A different human maintainer reviews and explicitly approves that draft under their own login.
-uv run --no-sync tacit review DRAFT_ID --repo REPOSITORY_ID
-uv run --no-sync tacit approvals approve DRAFT_ID --repo REPOSITORY_ID
-uv run --no-sync tacit approvals list DRAFT_ID --repo REPOSITORY_ID
-
-# A different current human maintainer confirms; their confirmation supplies the second person.
-uv run --no-sync tacit confirm DRAFT_ID --repo REPOSITORY_ID
-
-# Before publication, a reviewer may withdraw their own approval.
-uv run --no-sync tacit approvals withdraw DRAFT_ID --repo REPOSITORY_ID
-```
-
-Review and approve under each person's own human login. Do not use an agent token to impersonate a maintainer or publish test narration to a real project's knowledge. Approval itself does not publish and does not invoke Evon, Prisma or Timbre. The confirmer CLI allows a longer request timeout for fresh reviewer verification. A failed/uncertain confirmation should reuse its printed operation ID, as before.
-
-Verification: full Python 3.14.8 regression with disposable PostgreSQL 17 passed **816 tests, 33 skipped, zero failures/errors** (849 collected, 330.87 seconds), with three pre-existing Starlette deprecation warnings. Twenty-seven skips are SQLite variants whose PostgreSQL counterparts ran; six require explicit live Evon configuration. Final quorum/migration checks passed **47 tests with one SQLite concurrency skip** on each of Python 3.12.15, 3.13.17 and 3.14.8. These include distinct-human counting, repeated self-approval, exact content/base/policy bindings, withdrawal, credential expiry/revocation, current GitHub access, custom-role downgrades, provider failure, races between preflight and local commit, three-person quorum, CLI confirmation, at-most-once concurrent publication, receipt retries and migration roundtrip. The final focused checks cover the last fresh-reviewer short-circuit optimization after the full regression run began.
-
-Ruff, formatting, strict mypy (58 source modules), lockfile consistency and diff checks passed. CLI/API/contracts wheels and source distributions built successfully. The AST graph was refreshed. Private/local safe receipts are under `output/quorum-check/`; detailed full regression logs/JUnit are under `/tmp/tacit-quorum-regression.RlEBpH/`. The dedicated test PostgreSQL container was removed after verification; the working database was neither migrated nor otherwise modified for this task. No live GitHub/Gnani/Evon calls, real knowledge publication, commit or push were performed. Live two-account publication/quorum acceptance remains pending; the earlier team-role permission demonstration is separate. Offline teaching synchronization remains unimplemented.
-
-
-### Live two-account quorum acceptance — 2026-11-03
-
-The operator completed the synthetic `scheduler-demo` quorum check as `nexxucc` and `vanshjj`. After a verified private backup, migration `0009` was applied to the working development database and the API restarted. Existing knowledge and direct-role counts were preserved during migration. The operator enabled a two-person policy (version 1), temporarily granted `vanshjj` repository-only maintainer access and created draft `732a53c2-fa3a-4efc-8379-ed054e5f1ed2` with digest `62cb0fdfb9183e61be764104aa67aa915d000fbed377bd67f6e64d3abf68b059`.
-
-The operator's first confirmation as `nexxucc` returned `quorum_required` HTTP 409. `vanshjj` then reviewed and explicitly approved that exact digest under their own human login. Confirmation as `nexxucc` succeeded, creating revision `83360472-4026-4c06-8d81-dfc1015ed1f3` and snapshot `2bc3302e-68c6-4d3e-a84a-fdd012c558f7`, parent `ff964f49-8174-4280-874a-4e27876a213b`. Independent database checks verified the new head and quorum audit containing both distinct human IDs (`gh-139905374`, `gh-149251890`), required count 2, policy version 1 and the exact draft digest.
-
-Cleanup removed the temporary repository maintainer grant and restored a one-person publication policy at version 2. The synthetic acceptance record remains published in the demo repository; existing snapshots remain immutable. No Raahi knowledge was changed. Private backup and safe acceptance receipt are local under `output/quorum-live/`; do not commit them. Mark the tested two-person live publication flow passed. Live approval withdrawal, permission revocation between approval and confirmation, and larger quorums remain fixture-tested rather than operator-tested. Offline teaching synchronization remains the next implementation task.
-
-
-### Offline text teaching synchronization — 2026-11-03
-
-`tacit offline` provides an opt-in private queue for text teaching intent. Preparation, listing, inspection, rebasing and forgetting work without API access or credentials. Preparation requires an explicit human author ID, a trusted configured API URL, a local Git commit and file scope, and a pinned base snapshot (via `--lock` or `--expected-snapshot`; use `none` only for an empty head). This claimed author is checked against the actual authenticated human at synchronization; it grants no permission by itself.
-
-The queue stores reviewed text, optional typed rules/decision replacement, source hashes and local dirty-selection metadata. It does not store credentials or committed source bytes, perform background uploads, call a model/speech service, or publish knowledge. Dirty local source never replaces the source fetched from the pinned Git commit by the API. Saved-audio upload and transcription remain in the existing explicit voice workflow; this queue does not queue raw audio, preserve voice-correction lineage, perform offline Evon extraction or merge distributed edits.
-
-Example using a previously generated lock for Raahi; replace paths and intent with what the human maintainer has reviewed:
-
-```bash
-cd /home/vansh/Tacit
-export TACIT_API_URL=https://zodiac-bubbling-stereo.ngrok-free.dev
-
-# Works while the API/network is unavailable; no login or keyring access is needed.
-uv run --no-sync tacit offline prepare \
-  --repo gh-1406716088 --author gh-149251890 \
-  --commit 2c11b8c25a7e3dc478e8f0187e5a65ba716b40bd \
-  --file app/matcher.py --source-root /path/to/raahi-checkout \
-  --lock tacit.lock.json --text-file /private/path/reviewed-intent.txt
-
-uv run --no-sync tacit offline list
-uv run --no-sync tacit offline show ENTRY_ID
-
-# Once online, sign in as that human, review the displayed queue entry, then consent.
-uv run --no-sync tacit whoami
-uv run --no-sync tacit offline sync ENTRY_ID --source-root /path/to/raahi-checkout
-
-# Synchronization returns a private draft; publication is a separate human workflow.
-uv run --no-sync tacit review DRAFT_ID --repo gh-1406716088
-uv run --no-sync tacit confirm DRAFT_ID --repo gh-1406716088
-```
-
-The existing repository maintainer permissions and configured publication quorum still apply. Offline sync itself invokes neither `confirm` nor approval endpoints. All six MCP tools remain read-only. Preparation does not verify GitHub access or prove the commit is pushed; authenticated API draft creation does that online. A lock is a scope/base pin, not authorization or a signed source of truth.
-
-Before the first upload, sync checks the selected server, current source hashes, actual human identity and current knowledge head. Changed source is refused; inspect intent and prepare a new entry if necessary. A changed head is refused without silently overwriting newer knowledge. After reviewing intent against the new snapshot, explicitly change an **unattempted** queue entry's base:
-
-```bash
-uv run --no-sync tacit offline rebase ENTRY_ID --expected-snapshot NEW_SNAPSHOT_ID
-# Rebase asks for confirmation and assigns a fresh draft operation ID.
-uv run --no-sync tacit offline sync ENTRY_ID --source-root /path/to/raahi-checkout
-```
-
-Sync durably records `attempted` before sending a draft request. If the connection or local acknowledgement fails, retry the same entry: the operation ID, request and base remain fixed, allowing server idempotency to recover a draft that may already exist. Recovery deliberately does not require unchanged local source or an unchanged current head; it replays the original pinned request, never current working bytes. Only a definitive `snapshot_conflict` HTTP 409 resets an attempted entry to unattempted, because that response means no draft was committed for the operation. Other uncertain/rejected attempts remain immutable and must be investigated/recovered before any new teaching attempt. Do not repeatedly create new entries to work around an uncertain result.
-
-Successful sync saves the returned draft locally as `synced`; repeating it displays that saved result without contacting the API. This local copy does not prove current access, current publication status or later revocation. Use online review for current status. Never treat queue JSON as authenticated or portable authority.
-
-The default queue is the `offline-teaching` sibling of the native voice spool directory. `TACIT_OFFLINE_QUEUE` selects an explicit private local directory. Files are private JSON with native ACL/permission handling; they are not encrypted by Tacit. Retention is explicit, with at most twenty entries and 128 KiB per entry; no age-based deletion runs. Intent is limited to 8,000 characters and local/committed source files to the existing 64 KiB capture bound. Exclusive OS locking serializes queue writers and sync/rebase/delete operations, so other queue operations wait while a sync or its consent prompt holds that lock. Atomic replace and durable acknowledgement reuse the audio spool's platform storage implementation. Never store this queue in version control.
-
-```bash
-uv run --no-sync tacit offline forget ENTRY_ID
-```
-
-Forgetting asks for confirmation and deletes only local data. It cannot retract a draft or immutable publication already created on the server. If deleting an uncertain attempt, preserve its operation ID privately before investigating the server outcome. No server migration is required for this CLI-only feature. Native Windows/macOS queue behavior and operator-run online/offline acceptance remain separate from fixtures.
-
-
-Offline verification: full Python 3.14.8 regression with disposable PostgreSQL passed **830 tests, 33 skipped, zero failures/errors** (863 collected, 299.35 seconds), with three existing Starlette deprecation warnings. Twenty-seven skips were SQLite variants whose PostgreSQL counterparts ran; six require live Evon configuration. After adding the final disk-failure/capacity/corruption guards and tests, the focused offline/source/audio/snapshot regression passed **128 tests with one SQLite locking skip**. Final offline-specific tests passed **21 tests** on each supported Python version (3.12.15, 3.13.17, 3.14.8); these are repeated interpreter checks rather than independent scenarios.
-
-Coverage includes offline preparation without an HTTP client, explicit consent, account/agent/server mismatch, changed source/head, explicit rebase, immutable attempted-request digests, lost API responses, failure to persist attempt/acknowledgement, mismatched API output, exclusive queue capacity under competing processes, UUID collisions, corrupted-state refusal and explicit local deletion, escaped paths/symlinks, lock scope, source bounds and recovery against the actual draft API with fixture GitHub responses. Database inspection in those API tests confirms exactly one draft and no snapshot/publication receipt after retries.
-
-Ruff, formatting, strict mypy (59 source modules), lockfile consistency, diff checks, CLI wheel/source build and AST graph refresh passed. Detailed logs/JUnit remain at `/tmp/tacit-offline-regression.VZsXOS/`; safe local receipt is `output/offline-check/results.json`. The disposable test database was removed. No working-database migration, real knowledge upload/publication, live provider call, commit or push occurred. The remaining acceptance is a human-operated offline-to-online text queue run and native Windows/macOS storage/terminal checks. Existing saved-audio recovery remains a separate workflow.
-
-
-### Operator offline-to-online text queue acceptance — 2026-11-03
-
-The operator reported successful disconnected preparation of queue entry `50f0abf6-bf86-43e4-8bcb-bbe240c09c02`, operation `3fe07556-ac7c-4d43-998c-840dbf416774`, for synthetic scheduler-demo text. Online sync returned private draft `a058faa2-3d07-47ec-9ff0-4e0e941d7ed4` with matching statement, source commit and base snapshot. Repeating sync while disconnected returned the same saved draft and the local list reported `synced`.
-
-Independent read-only checks confirmed exactly one server draft for that author/repository/operation, no publication receipt for it, the synced local receipt, and unchanged repository head `2bc3302e-68c6-4d3e-a84a-fdd012c558f7`. The disconnect and terminal interactions are operator-reported; no independent network capture was taken. Mark this basic offline-to-online text flow and disconnected cached-result replay passed. Real interrupted in-flight upload/acknowledgement recovery, head conflicts, identity switching and native Windows/macOS queue behavior remain fixture-tested or externally pending. No model/speech call or publication was needed. Safe receipt remains local at `output/offline-live/result.json`; the queue and synthetic server draft are retained rather than silently deleted.
+Native Windows/macOS device acceptance, independent quality/handoff evaluation and production deployment/storage gates remain separate. Offline synchronization currently covers text intent; saved audio uses the existing voice recovery workflow. Consult [verification](VERIFICATION.md) and the dated [acceptance history](ACCEPTANCE_HISTORY.md) before treating a feature as validated for a particular environment.
