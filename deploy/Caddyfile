@@ -6,7 +6,9 @@
 {$TACIT_PUBLIC_HOST} {
 	encode zstd gzip
 	header -Server
-	@api path /v1/* /health/live /health/ready
+	# Remote MCP/OAuth routes exist only when TACIT_MCP_PUBLIC_URL is set; otherwise
+	# the API itself returns 404 for them.
+	@api path /v1/* /health/live /health/ready /mcp /mcp/* /authorize /token /revoke /oauth/consent /oauth/consent/* /.well-known/*
 	handle @api {
 		# Caddy upgrades WebSockets automatically and preserves the request
 		# body/signature headers used by GitHub's signed webhook endpoint.
