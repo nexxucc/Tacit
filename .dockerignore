@@ -22,3 +22,7 @@ recordings/
 !.env.example
 .tacit-recovery-*/
 tacit-recovery-*/
+look/
+code-check/
+/snapshot.json
+/tacit.lock.json

@@ -8,3 +8,13 @@ __pycache__/
 *.egg-info/
 dist/
 .tacit/
+
+# Private operational artifacts: database dumps, recovery bundles, acceptance
+# receipts, a separate Raahi checkout and video production assets. Never commit.
+/output/
+# Rendered video review frames.
+/look/
+/code-check/
+# Raahi pilot export/lock (private knowledge of another repository).
+/snapshot.json
+/tacit.lock.json

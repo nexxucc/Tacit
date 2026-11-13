@@ -1,0 +1,7 @@
+# Keep the knowledge graph scoped to Tacit's own source and docs.
+# output/ holds operational receipts, database dumps, a separate Raahi checkout
+# and video production assets (HyperFrames, gsap) that pollute communities.
+output/
+# Rendered video review frames.
+look/
+code-check/
