@@ -30,5 +30,5 @@ uv run --no-sync tacit workspaces list
 uv run --no-sync tacit repos list --workspace WORKSPACE_ID
 ```
 
-Complete GitHub's device flow. Human credentials use an approved OS keyring without plaintext fallback; delegated reads require `TACIT_AGENT_TOKEN`. HTTPS is required except on loopback. API/schema versions are `1`; evaluator version is `typed-expression-v2`. Explicit incompatible declarations receive `426 upgrade_required`; versionless legacy peers follow the implemented compatibility bridge.
+Complete GitHub's device flow. Human credentials use an approved OS keyring without plaintext fallback; delegated reads require `TACIT_AGENT_TOKEN`. HTTPS is required except on loopback. API/schema versions are `1`; evaluator version is `typed-expression-v2`. Explicit incompatible declarations receive `426 upgrade_required`; versionless legacy peers follow the implemented compatibility bridge. See [protocol compatibility](protocol-compatibility.md) for the full policy.
 

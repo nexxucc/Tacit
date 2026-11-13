@@ -1529,6 +1529,7 @@ flowchart LR
 - **[Backend setup and authentication](GETTING_STARTED.md)** — Configure the backend, run migrations and services, complete GitHub device login, and understand credential and version requirements.
 - **[Client installation and native platforms](PLATFORM_SETUP.md)** — Install Arch, Windows and macOS launchers; enable audio; locate private client data; and handle existing recordings and native permissions.
 - **[System design and trust boundaries](SYSTEM_DESIGN.md)** — Explore the seven workspace packages, PostgreSQL authority, source bindings, provider separation and human-only publication rules.
+- **[API, schema and evaluator compatibility](protocol-compatibility.md)** — Understand the version headers, the 426 upgrade-required response, WebSocket refusals and when a version must change.
 
 ### Teaching and collaboration
 
