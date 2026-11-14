@@ -18,3 +18,6 @@ dist/
 # Raahi pilot export/lock (private knowledge of another repository).
 /snapshot.json
 /tacit.lock.json
+
+# Website (kept out of this repository)
+/site/

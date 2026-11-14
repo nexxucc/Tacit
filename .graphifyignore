@@ -5,3 +5,5 @@ output/
 # Rendered video review frames.
 look/
 code-check/
+# Website (Node project; not part of the Tacit code graph)
+site/
