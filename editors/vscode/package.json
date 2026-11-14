@@ -3,6 +3,7 @@
   "displayName": "Tacit Source Selection",
   "description": "Export source-bound file, range and symbol selections for human-reviewed Tacit teaching.",
   "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
   "publisher": "tacit-local",
   "engines": {"vscode": "^1.85.0"},
   "main": "./extension.js",

@@ -1548,3 +1548,16 @@ flowchart LR
 
 - **[Testing and evaluation](VERIFICATION.md)** — Run lint, formatting, typing and test checks; configure disposable PostgreSQL coverage; and understand scenario, handoff and external acceptance gates.
 - **[Verification and acceptance history](ACCEPTANCE_HISTORY.md)** — Read the original dated regression results, operator voice/MCP/team/quorum/offline demonstrations, incident fixes and evidence limits.
+
+## License
+
+Tacit is licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in Tacit shall be dual-licensed as above, without any additional terms or conditions.
+
+Third-party components keep their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
